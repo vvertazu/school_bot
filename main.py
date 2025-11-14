@@ -1,16 +1,16 @@
 import asyncio
-import re
 import os
 import logging
 import sqlite3
 import datetime
+import re  # ← Добавлен для парсинга расписания
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton  # ✅ Исправлено: добавлен ReplyKeyboardMarkup
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -28,7 +28,7 @@ dp = Dispatcher(storage=storage)
 # ADMINS
 ADMINS = [7450525550, 5946158486]
 
-# Инициализация БД
+# Инициализация БД с исправленными типами
 def init_db():
     conn = sqlite3.connect('school_bot.db')
     cursor = conn.cursor()
@@ -38,9 +38,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             telegram_id INTEGER UNIQUE NOT NULL,
             full_name TEXT,
-            birth_date TEXT,
-            is_admin INTEGER DEFAULT 0,
-            joined_at TEXT DEFAULT CURRENT_TIMESTAMP
+            birth_date DATE,
+            is_admin BOOLEAN DEFAULT 0,
+            joined_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
@@ -63,9 +63,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             subject TEXT NOT NULL,
             description TEXT NOT NULL,
-            due_date TEXT NOT NULL,
-            added_by INTEGER NOT NULL, 
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            due_date TEXT NOT NULL CHECK(due_date LIKE '____-__-__'),
+            added_by INTEGER NOT NULL,  # ✅ Исправлено: BIGINT → INTEGER
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
@@ -73,11 +73,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS attendance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            date TEXT NOT NULL,
+            date DATE NOT NULL,
             status TEXT NOT NULL DEFAULT 'present',
             reason TEXT,
             marked_by INTEGER NOT NULL,
-            marked_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            marked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, date)
         )
     ''')
@@ -193,7 +193,7 @@ async def cmd_schedule(message: types.Message):
         else:
             target_date = datetime.date.today()
     except ValueError:
-        await message.answer("Формат: /schedule 17.11.2025")
+        await message.answer("❌ Формат: /schedule 17.11.2025")
         return
 
     day_of_week = target_date.isoweekday()
@@ -209,49 +209,37 @@ async def cmd_schedule(message: types.Message):
     )
     
     if not lessons:
-        await message.answer(f"📅 На {DAYS[day_of_week].lower()} ({target_date:%d.%m.%Y}) — пусто")
+        await message.answer(f"📅 На {DAYS[day_of_week].lower()} ({target_date:%d.%m.%Y}) — расписание не задано")
         return
     
     text = f"📅 **{DAYS[day_of_week]} ({target_date:%d.%m.%Y})**\n\n"
     for row in lessons:
-        lesson_num = row[0]
-        subject = row[1]
-        classroom = row[2]
-        start_time = row[3]
-        end_time = row[4]
-        lesson_type = row[5]
-        teacher = row[6]
+        num, subject, room, start, end, ltype, teacher = row
         
-        time_str = f"🕗 {start_time}-{end_time}" if start_time and end_time else ""
-        type_str = f" ({lesson_type})" if lesson_type else ""
-        room_str = f" 📍 {classroom}" if classroom else ""
-        teacher_str = f" 👩‍🏫 {teacher}" if teacher else ""
+        # Формируем строку урока
+        lesson_str = f"{num}. **{subject}**"
+        if ltype:
+            lesson_str += f" ({ltype})"
         
-        text += f"{lesson_num}. {subject}{type_str}\n"
-        if time_str:
-            text += f"   {time_str}{room_str}{teacher_str}\n\n"
+        # Добавляем время и место
+        details = []
+        if start and end:
+            details.append(f"🕗 {start}-{end}")
+        if room:
+            details.append(f"📍 {room}")
+        if teacher:
+            details.append(f"👩‍🏫 {teacher}")
+        
+        if details:
+            lesson_str += "\n   • " + "\n   • ".join(details)
+        
+        text += lesson_str + "\n\n"
     
-    await message.answer(text, parse_mode="Markdown") 
-
-@dp.message(Command("whoami"))
-async def cmd_whoami(message: types.Message):
-    user_id = message.from_user.id
-    user = await get_user(user_id)
+    # Обрезаем текст, если слишком длинный
+    if len(text) > 4000:
+        text = text[:3997] + "..."
     
-    if not user:
-        await message.answer("❌ Вы не зарегистрированы. Напишите /start")
-        return
-
-    full_name, is_admin = user
-    admin_status = "✅ Админ" if is_admin else "❌ Не админ"
-    
-    await message.answer(
-        f"👤 **Ваша информация**\n\n"
-        f"🔹 ID: `{user_id}`\n"
-        f"🔹 ФИО: {full_name or 'не указано'}\n"
-        f"🔹 Статус: {admin_status}",
-        parse_mode="Markdown"
-    )
+    await message.answer(text, parse_mode="Markdown")
 
 @dp.message(Command("announce"))
 async def cmd_announce(message: types.Message):
@@ -279,16 +267,15 @@ async def cmd_announce(message: types.Message):
 
 @dp.message(Command("make_admin"))
 async def make_admin(message: types.Message):
-    password = message.text.replace("/make_admin", "").strip()
-    if password == "sunnatjalab":  # ← ваш пароль
+    if message.from_user.id in ADMINS:
         await execute_query("UPDATE users SET is_admin = 1 WHERE telegram_id = ?", (message.from_user.id,))
         await message.answer("✅ Ты теперь админ!")
     else:
-        await message.answer("❌ Неверный пароль")
+        await message.answer("❌ Эта команда только для владельца.")
 
 @dp.message(Command("homework"))
 async def cmd_homework(message: types.Message):
-    today = datetime.date.today()
+    today = datetime.date.today().strftime("%Y-%m-%d")
     hw_list = await execute_query(
         "SELECT subject, description, due_date FROM homework WHERE due_date >= ? ORDER BY due_date",
         (today,), fetch=True
@@ -339,13 +326,17 @@ async def cmd_add_hw(message: types.Message):
     else:
         desc_part = rest
 
+    # Форматируем дату как YYYY-MM-DD для SQLite
+    due_date_str = due_date.strftime("%Y-%m-%d")
+
     await execute_query(
         "INSERT INTO homework (subject, description, due_date, added_by) VALUES (?, ?, ?, ?)",
-        (subject, desc_part.strip(), due_date, message.from_user.id)
+        (subject, desc_part.strip(), due_date_str, message.from_user.id)
     )
     
     await message.answer(f"ДЗ по **{subject}** до {due_date:%d.%m}", parse_mode="Markdown")
 
+# ✅ Полностью обновленный хендлер для расписания
 @dp.message(Command("add_schedule"))
 async def cmd_add_schedule(message: types.Message):
     user = await get_user(message.from_user.id)
@@ -355,7 +346,11 @@ async def cmd_add_schedule(message: types.Message):
     
     raw = message.text.replace("/add_schedule", "", 1).strip()
     if ":" not in raw:
-        await message.answer("Формат: /add_schedule 17.11.2025: 1. 11:50-13:20 Предмет (тип) (кабинет) Преподаватель")
+        await message.answer(
+            "Формат: /add_schedule 17.11.2025: "
+            "1. 11:50-13:20 Иностранный язык (семинар) (305к.1) Казакова Е.Д., "
+            "2. 13:50-15:20 Правовое обеспечение (семинар) (315к.1) Магомедрасулова Э.З."
+        )
         return
     
     date_part, lessons_part = raw.split(":", 1)
@@ -364,44 +359,50 @@ async def cmd_add_schedule(message: types.Message):
     try:
         date_obj = datetime.datetime.strptime(date_part, "%d.%m.%Y").date()
     except ValueError:
-        await message.answer("Формат даты: 17.11.2025")
+        await message.answer("❌ Формат даты: 17.11.2025")
         return
     
     day_of_week = date_obj.isoweekday()
     await execute_query("DELETE FROM schedule WHERE day_of_week = ?", (day_of_week,))
     
-    for lesson in lessons_part.split(","):
-        lesson = lesson.strip()
-        if "." not in lesson:
-            continue
-        
+    lessons = [lesson.strip() for lesson in lessons_part.split(",") if lesson.strip()]
+    if not lessons:
+        await message.answer("⚠️ Не найдено уроков для добавления")
+        return
+    
+    success_count = 0
+    for lesson in lessons:
         try:
-            # Разбираем номер урока
-            num_part, rest = lesson.split(".", 1)
-            lesson_num = int(num_part.strip())
+            # Извлекаем номер урока (1., 2., ...)
+            num_match = re.match(r"(\d+)\.\s*(.*)", lesson)
+            if not num_match:
+                continue
+            lesson_num = int(num_match.group(1))
+            rest = num_match.group(2)
             
             # Извлекаем время (11:50-13:20)
             time_match = re.search(r"(\d{2}:\d{2})-(\d{2}:\d{2})", rest)
-            start_time = time_match.group(1) if time_match else None
-            end_time = time_match.group(2) if time_match else None
-            
-            # Удаляем время из строки
+            start_time = end_time = None
             if time_match:
+                start_time = time_match.group(1)
+                end_time = time_match.group(2)
                 rest = rest.replace(f"{start_time}-{end_time}", "").strip()
             
             # Извлекаем тип занятия (семинар/лекция)
+            type_match = re.search(r"\(([^)]+)\)", rest)
             lesson_type = ""
-            if "(" in rest and ")" in rest:
-                lesson_type = rest.split("(")[1].split(")")[0].strip()
+            if type_match:
+                lesson_type = type_match.group(1).strip()
                 rest = rest.replace(f"({lesson_type})", "").strip()
             
-            # Извлекаем кабинет
+            # Извлекаем кабинет (305к.1)
+            room_match = re.search(r"\(([^)]+)\)", rest)
             classroom = ""
-            if "(" in rest and ")" in rest:
-                classroom = rest.split("(")[1].split(")")[0].strip()
+            if room_match:
+                classroom = room_match.group(1).strip()
                 rest = rest.replace(f"({classroom})", "").strip()
             
-            # Оставшееся — название предмета и преподаватель
+            # Оставшееся — предмет и преподаватель
             parts = rest.split()
             if len(parts) >= 2:
                 subject = " ".join(parts[:-1])
@@ -416,11 +417,16 @@ async def cmd_add_schedule(message: types.Message):
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (day_of_week, lesson_num, subject, classroom, start_time, end_time, lesson_type, teacher)
             )
+            success_count += 1
+            
         except Exception as e:
-            logger.error(f"Ошибка парсинга урока: {lesson} — {e}")
+            logger.error(f"Ошибка парсинга урока '{lesson}': {str(e)}")
             continue
     
-    await message.answer(f"✅ Расписание на {date_obj:%d.%m.%Y} обновлено")
+    if success_count:
+        await message.answer(f"✅ Добавлено {success_count} уроков на {date_obj:%d.%m.%Y}")
+    else:
+        await message.answer("❌ Не удалось добавить ни одного урока")
 
 @dp.message(Command("attendance"))
 async def cmd_attendance(message: types.Message):
@@ -445,7 +451,7 @@ async def cmd_attendance(message: types.Message):
         f"**Посещаемость (30 дней)**\n\n"
         f"Присутствовал: {present}/{total}\n"
         f"**{percentage}%**\n\n"
-        "Напиши дату: 30.10.2025",
+        "Напиши дату: 17.11.2025",
         parse_mode="Markdown"
     )
 
@@ -647,7 +653,24 @@ async def run_bot():
     logger.info("Бот запущен!")
     await dp.start_polling(bot)
 
+# Обработка SIGTERM для Render
+async def shutdown(signal, loop):
+    logger.info(f"Получен сигнал {signal.name}...")
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    [task.cancel() for task in tasks]
+    await asyncio.gather(*tasks, return_exceptions=True)
+    loop.stop()
+
 async def main():
+    loop = asyncio.get_running_loop()
+    
+    # Регистрация обработчиков сигналов
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(
+            sig,
+            lambda s=sig: asyncio.create_task(shutdown(s, loop))
+        )
+    
     # Запускаем веб-сервер и бота параллельно
     await asyncio.gather(
         web_server(),
@@ -656,4 +679,10 @@ async def main():
     )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен вручную")
+    except Exception as e:
+        logger.exception(f"Критическая ошибка: {e}")
+        raise
