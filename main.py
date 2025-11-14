@@ -61,15 +61,15 @@ def init_db():
     ''')
     
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS homework (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subject TEXT NOT NULL,
-            description TEXT NOT NULL,
-            due_date TEXT NOT NULL CHECK(due_date LIKE '____-__-__'),
-            added_by INTEGER NOT NULL,  # ✅ Исправлено: BIGINT → INTEGER
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    CREATE TABLE IF NOT EXISTS homework (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        subject TEXT NOT NULL,
+        description TEXT NOT NULL,
+        due_date TEXT NOT NULL CHECK(due_date LIKE '____-__-__'),
+        added_by INTEGER NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+''')
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS attendance (
