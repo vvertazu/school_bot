@@ -267,6 +267,26 @@ async def cmd_announce(message: types.Message):
 
     await message.answer(f"Отправлено: {sent}, ошибок: {failed}")
 
+@dp.message(Command("whoami"))
+async def cmd_whoami(message: types.Message):
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    
+    if not user:
+        await message.answer("❌ Вы не зарегистрированы. Напишите /start")
+        return
+
+    full_name, is_admin = user
+    admin_status = "✅ Админ" if is_admin else "❌ Не админ"
+    
+    await message.answer(
+        f"👤 **Ваша информация**\n\n"
+        f"🔹 ID: `{user_id}`\n"
+        f"🔹 ФИО: {full_name or 'не указано'}\n"
+        f"🔹 Статус: {admin_status}",
+        parse_mode="Markdown"
+    )
+
 @dp.message(Command("make_admin"))
 async def make_admin(message: types.Message):
     if message.from_user.id in ADMINS:
