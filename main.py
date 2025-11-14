@@ -44,17 +44,13 @@ def init_db():
         )
     ''')
     
-    cursor.execute('''
+cursor.execute('''
     CREATE TABLE IF NOT EXISTS schedule (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        day_of_week INTEGER NOT NULL,
-        lesson_number INTEGER NOT NULL,
-        subject TEXT NOT NULL,
-        classroom TEXT,
-        start_time TEXT,  -- Новое поле
-        end_time TEXT,    -- Новое поле
-        lesson_type TEXT, -- "лекция", "семинар"
-        teacher TEXT      -- Новое поле
+        ...,
+        start_time TEXT,
+        end_time TEXT,
+        lesson_type TEXT,
+        teacher TEXT
     )
 ''')
     
