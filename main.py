@@ -28,7 +28,7 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 # ADMINS
-ADMINS = [7450525550, 5946158486]
+ADMINS = [7450525550]
 
 # Инициализация БД с исправленными типами
 def init_db():
@@ -148,9 +148,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if result and result[0]:
         await message.answer(
             f"Привет, {result[0]}! 👋\n\n"
-            "/schedule — Расписание\n"
+            "/schedule — Расписание Пример/schedule ДД.ММ.ГГГГ\n"
             "/homework — ДЗ\n"
-            "/attendance — Посещаемость\n"
             "/support — Помощь"
         )
     else:
@@ -425,13 +424,16 @@ async def cmd_add_schedule(message: types.Message):
                 rest = rest.replace(f"({classroom})", "").strip()
             
             # Оставшееся — предмет и преподаватель
-            parts = rest.split()
-            if len(parts) >= 2:
-                subject = " ".join(parts[:-1])
-                teacher = parts[-1]
-            else:
-                subject = rest
-                teacher = ""
+           parts = rest.split()
+if len(parts) >= 2:
+    teacher = " ".join(parts[-2:])
+    subject = " ".join(parts[:-2])
+elif len(parts) == 1:
+    subject = parts[0]
+    teacher = ""
+else:
+    subject = rest
+    teacher = ""
             
             # Сохраняем в БД
             await execute_query(
