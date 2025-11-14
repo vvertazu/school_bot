@@ -36,44 +36,48 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id BIGINT UNIQUE NOT NULL,
+            telegram_id INTEGER UNIQUE NOT NULL,
             full_name TEXT,
-            birth_date DATE,
-            is_admin BOOLEAN DEFAULT 0,
-            joined_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            birth_date TEXT,
+            is_admin INTEGER DEFAULT 0,
+            joined_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS schedule (
-        ...,
-        start_time TEXT,
-        end_time TEXT,
-        lesson_type TEXT,
-        teacher TEXT
-    )
-''')
-    
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS homework (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        subject TEXT NOT NULL,
-        description TEXT NOT NULL,
-        due_date TEXT NOT NULL,  -- Изменено с DATE на TEXT
-        added_by INTEGER NOT NULL, 
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-''')
-    
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS attendance (
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS schedule (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id BIGINT NOT NULL,
-            date DATE NOT NULL,
+            day_of_week INTEGER NOT NULL,
+            lesson_number INTEGER NOT NULL,
+            subject TEXT NOT NULL,
+            classroom TEXT,
+            start_time TEXT,
+            end_time TEXT,
+            lesson_type TEXT,
+            teacher TEXT
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS homework (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT NOT NULL,
+            description TEXT NOT NULL,
+            due_date TEXT NOT NULL,
+            added_by INTEGER NOT NULL, 
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'present',
             reason TEXT,
-            marked_by BIGINT NOT NULL,
-            marked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            marked_by INTEGER NOT NULL,
+            marked_at TEXT DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, date)
         )
     ''')
