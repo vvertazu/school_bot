@@ -55,15 +55,15 @@ cursor.execute('''
 ''')
     
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS homework (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subject TEXT NOT NULL,
-            description TEXT NOT NULL,
-            due_date DATE NOT NULL,
-            added_by BIGINT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    CREATE TABLE IF NOT EXISTS homework (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        subject TEXT NOT NULL,
+        description TEXT NOT NULL,
+        due_date DATE NOT NULL,
+        added_by INTEGER NOT NULL, 
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+''')
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS attendance (
