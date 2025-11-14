@@ -1,4 +1,5 @@
 import asyncio
+import re
 import os
 import logging
 import sqlite3
@@ -192,7 +193,7 @@ async def cmd_schedule(message: types.Message):
         else:
             target_date = datetime.date.today()
     except ValueError:
-        await message.answer("Формат: /schedule 30.10.2025")
+        await message.answer("Формат: /schedule 17.11.2025")
         return
 
     day_of_week = target_date.isoweekday()
@@ -202,7 +203,8 @@ async def cmd_schedule(message: types.Message):
     }
     
     lessons = await execute_query(
-        "SELECT lesson_number, subject, classroom FROM schedule WHERE day_of_week = ? ORDER BY lesson_number",
+        "SELECT lesson_number, subject, classroom, start_time, end_time, lesson_type, teacher "
+        "FROM schedule WHERE day_of_week = ? ORDER BY lesson_number",
         (day_of_week,), fetch=True
     )
     
@@ -211,9 +213,23 @@ async def cmd_schedule(message: types.Message):
         return
     
     text = f"📅 **{DAYS[day_of_week]} ({target_date:%d.%m.%Y})**\n\n"
-    for num, subject, room in lessons:
-        room_str = f" (каб. {room})" if room else ""
-        text += f"{num}. {subject}{room_str}\n"
+    for row in lessons:
+        lesson_num = row[0]
+        subject = row[1]
+        classroom = row[2]
+        start_time = row[3]
+        end_time = row[4]
+        lesson_type = row[5]
+        teacher = row[6]
+        
+        time_str = f"🕗 {start_time}-{end_time}" if start_time and end_time else ""
+        type_str = f" ({lesson_type})" if lesson_type else ""
+        room_str = f" 📍 {classroom}" if classroom else ""
+        teacher_str = f" 👩‍🏫 {teacher}" if teacher else ""
+        
+        text += f"{lesson_num}. {subject}{type_str}\n"
+        if time_str:
+            text += f"   {time_str}{room_str}{teacher_str}\n\n"
     
     await message.answer(text, parse_mode="Markdown") 
 
@@ -339,7 +355,7 @@ async def cmd_add_schedule(message: types.Message):
     
     raw = message.text.replace("/add_schedule", "", 1).strip()
     if ":" not in raw:
-        await message.answer("/add_schedule 30.10.2025: 1. Математика (304), 2. Физика")
+        await message.answer("Формат: /add_schedule 17.11.2025: 1. 11:50-13:20 Предмет (тип) (кабинет) Преподаватель")
         return
     
     date_part, lessons_part = raw.split(":", 1)
@@ -348,7 +364,7 @@ async def cmd_add_schedule(message: types.Message):
     try:
         date_obj = datetime.datetime.strptime(date_part, "%d.%m.%Y").date()
     except ValueError:
-        await message.answer("Формат даты: 30.10.2025")
+        await message.answer("Формат даты: 17.11.2025")
         return
     
     day_of_week = date_obj.isoweekday()
@@ -358,21 +374,50 @@ async def cmd_add_schedule(message: types.Message):
         lesson = lesson.strip()
         if "." not in lesson:
             continue
+        
         try:
+            # Разбираем номер урока
             num_part, rest = lesson.split(".", 1)
             lesson_num = int(num_part.strip())
-            if "(" in rest and ")" in rest:
-                subject = rest.split("(")[0].strip()
-                classroom = rest.split("(")[1].split(")")[0].strip()
-            else:
-                subject, classroom = rest.strip(), ""
             
+            # Извлекаем время (11:50-13:20)
+            time_match = re.search(r"(\d{2}:\d{2})-(\d{2}:\d{2})", rest)
+            start_time = time_match.group(1) if time_match else None
+            end_time = time_match.group(2) if time_match else None
+            
+            # Удаляем время из строки
+            if time_match:
+                rest = rest.replace(f"{start_time}-{end_time}", "").strip()
+            
+            # Извлекаем тип занятия (семинар/лекция)
+            lesson_type = ""
+            if "(" in rest and ")" in rest:
+                lesson_type = rest.split("(")[1].split(")")[0].strip()
+                rest = rest.replace(f"({lesson_type})", "").strip()
+            
+            # Извлекаем кабинет
+            classroom = ""
+            if "(" in rest and ")" in rest:
+                classroom = rest.split("(")[1].split(")")[0].strip()
+                rest = rest.replace(f"({classroom})", "").strip()
+            
+            # Оставшееся — название предмета и преподаватель
+            parts = rest.split()
+            if len(parts) >= 2:
+                subject = " ".join(parts[:-1])
+                teacher = parts[-1]
+            else:
+                subject = rest
+                teacher = ""
+            
+            # Сохраняем в БД
             await execute_query(
-                "INSERT INTO schedule (day_of_week, lesson_number, subject, classroom) VALUES (?, ?, ?, ?)",
-                (day_of_week, lesson_num, subject, classroom)
+                "INSERT INTO schedule (day_of_week, lesson_number, subject, classroom, start_time, end_time, lesson_type, teacher) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (day_of_week, lesson_num, subject, classroom, start_time, end_time, lesson_type, teacher)
             )
         except Exception as e:
-            logger.warning(f"Ошибка парсинга урока: {lesson} — {e}")
+            logger.error(f"Ошибка парсинга урока: {lesson} — {e}")
             continue
     
     await message.answer(f"✅ Расписание на {date_obj:%d.%m.%Y} обновлено")
