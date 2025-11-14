@@ -357,7 +357,6 @@ async def cmd_add_hw(message: types.Message):
     
     await message.answer(f"ДЗ по **{subject}** до {due_date:%d.%m}", parse_mode="Markdown")
 
-# ✅ Полностью обновленный хендлер для расписания
 @dp.message(Command("add_schedule"))
 async def cmd_add_schedule(message: types.Message):
     user = await get_user(message.from_user.id)
@@ -423,17 +422,30 @@ async def cmd_add_schedule(message: types.Message):
                 classroom = room_match.group(1).strip()
                 rest = rest.replace(f"({classroom})", "").strip()
             
-            # Оставшееся — предмет и преподаватель
-           parts = rest.split()
-if len(parts) >= 2:
-    teacher = " ".join(parts[-2:])
-    subject = " ".join(parts[:-2])
-elif len(parts) == 1:
-    subject = parts[0]
-    teacher = ""
-else:
-    subject = rest
-    teacher = ""
+            # ✅ ИСПРАВЛЕНО: Правильный парсинг преподавателя в формате "Казакова Е.Д."
+            rest = rest.strip()
+            teacher = ""
+            subject = rest
+            
+            # Поиск ФИО с инициалами в конце строки
+            teacher_match = re.search(r'([А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.)$', rest)
+            if teacher_match:
+                teacher = teacher_match.group(1).strip()
+                subject = rest[:teacher_match.start()].strip()
+            else:
+                # Поиск ФИО с одной буквой инициалов (Смирнов А.)
+                simple_match = re.search(r'([А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.)$', rest)
+                if simple_match:
+                    teacher = simple_match.group(1).strip()
+                    subject = rest[:simple_match.start()].strip()
+            
+            # Очистка от лишних пробелов
+            subject = re.sub(r'\s+', ' ', subject).strip()
+            teacher = re.sub(r'\s+', ' ', teacher).strip()
+            
+            # Если предмет пустой - используем тип занятия как заглушку
+            if not subject and lesson_type:
+                subject = lesson_type
             
             # Сохраняем в БД
             await execute_query(
