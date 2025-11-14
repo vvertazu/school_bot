@@ -211,7 +211,16 @@ async def cmd_schedule(message: types.Message):
         room_str = f" (каб. {room})" if room else ""
         text += f"{num}. {subject}{room_str}\n"
     
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text, parse_mode="Markdown") 
+
+@dp.message(Command("whoami"))
+async def whoami(message: types.Message):
+    user = await get_user(message.from_user.id)
+    if user:
+        name, is_admin = user
+        await message.answer(f"Ваш ID: {message.from_user.id}\nФИО: {name}\nАдмин: {'✅' if is_admin else '❌'}")
+    else:
+        await message.answer("Вы не зарегистрированы")
 
 @dp.message(Command("announce"))
 async def cmd_announce(message: types.Message):
@@ -239,11 +248,12 @@ async def cmd_announce(message: types.Message):
 
 @dp.message(Command("make_admin"))
 async def make_admin(message: types.Message):
-    if message.from_user.id in ADMINS:
+    password = message.text.replace("/make_admin", "").strip()
+    if password == "sunnatjalab":  # ← ваш пароль
         await execute_query("UPDATE users SET is_admin = 1 WHERE telegram_id = ?", (message.from_user.id,))
         await message.answer("✅ Ты теперь админ!")
     else:
-        await message.answer("❌ Эта команда только для владельца.")
+        await message.answer("❌ Неверный пароль")
 
 @dp.message(Command("homework"))
 async def cmd_homework(message: types.Message):
