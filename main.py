@@ -214,13 +214,24 @@ async def cmd_schedule(message: types.Message):
     await message.answer(text, parse_mode="Markdown") 
 
 @dp.message(Command("whoami"))
-async def whoami(message: types.Message):
-    user = await get_user(message.from_user.id)
-    if user:
-        name, is_admin = user
-        await message.answer(f"Ваш ID: {message.from_user.id}\nФИО: {name}\nАдмин: {'✅' if is_admin else '❌'}")
-    else:
-        await message.answer("Вы не зарегистрированы")
+async def cmd_whoami(message: types.Message):
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    
+    if not user:
+        await message.answer("❌ Вы не зарегистрированы. Напишите /start")
+        return
+
+    full_name, is_admin = user
+    admin_status = "✅ Админ" if is_admin else "❌ Не админ"
+    
+    await message.answer(
+        f"👤 **Ваша информация**\n\n"
+        f"🔹 ID: `{user_id}`\n"
+        f"🔹 ФИО: {full_name or 'не указано'}\n"
+        f"🔹 Статус: {admin_status}",
+        parse_mode="Markdown"
+    )
 
 @dp.message(Command("announce"))
 async def cmd_announce(message: types.Message):
