@@ -3,7 +3,9 @@ import os
 import logging
 import sqlite3
 import datetime
-import re  # ← Добавлен для парсинга расписания
+import re
+import signal  # ← Обязательно добавьте
+
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -685,4 +687,4 @@ if __name__ == "__main__":
         logger.info("Бот остановлен вручную")
     except Exception as e:
         logger.exception(f"Критическая ошибка: {e}")
-        raise
+        raise                                                                                       
