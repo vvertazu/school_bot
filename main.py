@@ -65,8 +65,8 @@ cursor.execute('''
     )
 ''')
     
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS attendance (
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS attendance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id BIGINT NOT NULL,
             date DATE NOT NULL,
