@@ -699,7 +699,10 @@ async def cmd_birthdays_list(message: types.Message):
 
     text = "**Список студентов и ДР**\n\n"
     for name, bdate, tg_id in students:
-        bdate_str = bdate.strftime("%d.%m") if bdate else "не указан"
+        if bdate and len(bdate) >= 10:
+            bdate_str = f"{bdate[8:10]}.{bdate[5:7]}"
+        else:
+            bdate_str = "не указан"
         text += f"• {name} (`{tg_id}`) — {bdate_str}\n"
 
     await message.answer(text, parse_mode="Markdown")
