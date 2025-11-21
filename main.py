@@ -4,7 +4,7 @@ import logging
 import sqlite3
 import datetime
 import re
-import signal  # ← Обязательно добавьте
+import signal
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -18,12 +18,8 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# В логах ищите:
-logger.info(f"✅ Пользователь {user_id} стал админом")
-logger.warning(f"❌ Неудачная попытка входа: {user_id}")
-
 # 🔑 Секретный пароль для получения прав админа (храните в переменных окружения!)
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "sunnatjalab")  # ← Замените на свой надёжный пароль
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "sunnatjalab")
 
 # 🔑 ТОКЕН (добавь в Render Environment Variables)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -47,17 +43,17 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             telegram_id INTEGER UNIQUE NOT NULL,
             full_name TEXT,
-            birth_date DATE,
-            is_admin BOOLEAN DEFAULT 0,
-            joined_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            birth_date TEXT,
+            is_admin INTEGER DEFAULT 0,
+            joined_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
-    # ✅ ИСПРАВЛЕНО: расписание хранится по датам, а не по дням недели
+    # Расписание по датам
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS schedule (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date DATE NOT NULL,  -- Храним конкретную дату
+            date TEXT NOT NULL,  -- Храним как текст в формате YYYY-MM-DD
             lesson_number INTEGER NOT NULL,
             subject TEXT NOT NULL,
             classroom TEXT,
@@ -65,45 +61,44 @@ def init_db():
             end_time TEXT,
             lesson_type TEXT,
             teacher TEXT,
-            UNIQUE(date, lesson_number)  -- Предотвращаем дубликаты уроков на одну дату
+            UNIQUE(date, lesson_number)
         )
     ''')
     
-    # ✅ ИСПРАВЛЕНО: BIGINT → INTEGER для added_by
+    # Домашние задания
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS homework (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             subject TEXT NOT NULL,
             description TEXT NOT NULL,
             due_date TEXT NOT NULL CHECK(due_date LIKE '____-__-__'),
-            added_by INTEGER NOT NULL,  -- ✅ Исправлено: BIGINT → INTEGER
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            added_by INTEGER NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
-    # ✅ ИСПРАВЛЕНО: BIGINT → INTEGER для user_id и marked_by
+    # Посещаемость
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS attendance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,  -- ✅ Исправлено: BIGINT → INTEGER
-            date DATE NOT NULL,
+            user_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'present',
             reason TEXT,
-            marked_by INTEGER NOT NULL,  -- ✅ Исправлено: BIGINT → INTEGER
-            marked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            marked_by INTEGER NOT NULL,
+            marked_at TEXT DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, date)
         )
     ''')
     
-    # ➕ ДОПОЛНИТЕЛЬНЫЕ ОПТИМИЗАЦИИ:
-    # Индексы для ускорения запросов
+    # Индексы для ускорения
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_schedule_date ON schedule(date)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_homework_due_date ON homework(due_date)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date)')
     
     conn.commit()
     conn.close()
-    logger.info("✅ База данных инициализирована с поддержкой расписания по датам")
+    logger.info("✅ База данных инициализирована")
 
 # Состояния
 class Form(StatesGroup):
@@ -220,11 +215,10 @@ async def cmd_schedule(message: types.Message):
     }
     day_name = DAYS.get(target_date.isoweekday(), "Неизвестный день")
     
-    # ✅ ЗАПРАШИВАЕМ РАСПИСАНИЕ ТОЛЬКО НА КОНКРЕТНУЮ ДАТУ
     lessons = await execute_query(
         "SELECT lesson_number, subject, classroom, start_time, end_time, lesson_type, teacher "
         "FROM schedule WHERE date = ? ORDER BY lesson_number",
-        (target_date,), fetch=True
+        (target_date.strftime("%Y-%m-%d"),), fetch=True
     )
     
     if not lessons:
@@ -291,7 +285,6 @@ async def clear_homework_start(message: types.Message, state: FSMContext):
         await message.answer("🚫 Только админ")
         return
     
-    # Показываем предупреждение с количеством записей
     count = await execute_query("SELECT COUNT(*) FROM homework", fetch=True)
     total = count[0][0] if count else 0
     
@@ -338,7 +331,6 @@ async def clear_schedule_start(message: types.Message, state: FSMContext):
         await message.answer("🚫 Только админ")
         return
     
-    # Показываем предупреждение с количеством записей
     count = await execute_query("SELECT COUNT(*) FROM schedule", fetch=True)
     total = count[0][0] if count else 0
     
@@ -415,7 +407,6 @@ async def make_admin_start(message: types.Message, state: FSMContext):
 @dp.message(AdminPassword.waiting_for_password)
 async def process_admin_password(message: types.Message, state: FSMContext):
     if message.text == ADMIN_PASSWORD:
-        # Даём права админа
         await execute_query(
             "UPDATE users SET is_admin = 1 WHERE telegram_id = ?",
             (message.from_user.id,)
@@ -495,7 +486,6 @@ async def cmd_add_hw(message: types.Message):
     else:
         desc_part = rest
 
-    # Форматируем дату как YYYY-MM-DD для SQLite
     due_date_str = due_date.strftime("%Y-%m-%d")
 
     await execute_query(
@@ -530,8 +520,7 @@ async def cmd_add_schedule(message: types.Message):
         await message.answer("❌ Формат даты: 01.12.2025")
         return
     
-    # ✅ УДАЛЯЕМ ТОЛЬКО РАСПИСАНИЕ НА ЭТУ КОНКРЕТНУЮ ДАТУ
-    await execute_query("DELETE FROM schedule WHERE date = ?", (target_date,))
+    await execute_query("DELETE FROM schedule WHERE date = ?", (target_date.strftime("%Y-%m-%d"),))
     
     lessons = [lesson.strip() for lesson in lessons_part.split(",") if lesson.strip()]
     if not lessons:
@@ -541,13 +530,44 @@ async def cmd_add_schedule(message: types.Message):
     success_count = 0
     for lesson in lessons:
         try:
-            # ... (оставьте весь парсинг без изменений до блока сохранения)
+            # Разбираем номер урока
+            num_part, rest = lesson.split(".", 1)
+            lesson_num = int(num_part.strip())
             
-            # ✅ СОХРАНЯЕМ С УКАЗАНИЕМ КОНКРЕТНОЙ ДАТЫ
+            # Извлекаем время
+            time_match = re.search(r"(\d{2}:\d{2})-(\d{2}:\d{2})", rest)
+            start_time = time_match.group(1) if time_match else None
+            end_time = time_match.group(2) if time_match else None
+            
+            if time_match:
+                rest = rest.replace(f"{start_time}-{end_time}", "").strip()
+            
+            # Извлекаем тип занятия
+            lesson_type = ""
+            if "(" in rest and ")" in rest:
+                lesson_type = rest.split("(")[1].split(")")[0].strip()
+                rest = rest.replace(f"({lesson_type})", "").strip()
+            
+            # Извлекаем кабинет
+            classroom = ""
+            if "(" in rest and ")" in rest:
+                classroom = rest.split("(")[1].split(")")[0].strip()
+                rest = rest.replace(f"({classroom})", "").strip()
+            
+            # Оставшееся — предмет и преподаватель
+            parts = rest.split()
+            if len(parts) >= 2:
+                subject = " ".join(parts[:-1])
+                teacher = parts[-1]
+            else:
+                subject = rest
+                teacher = ""
+            
+            # Сохраняем
             await execute_query(
                 "INSERT INTO schedule (date, lesson_number, subject, classroom, start_time, end_time, lesson_type, teacher) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (target_date, lesson_num, subject, classroom, start_time, end_time, lesson_type, teacher)
+                (target_date.strftime("%Y-%m-%d"), lesson_num, subject, classroom, start_time, end_time, lesson_type, teacher)
             )
             success_count += 1
             
@@ -567,13 +587,13 @@ async def cmd_attendance(message: types.Message):
     
     total_rows = await execute_query(
         "SELECT COUNT(*) FROM attendance WHERE user_id = ? AND date BETWEEN ? AND ?",
-        (message.from_user.id, month_ago, today), fetch=True
+        (message.from_user.id, month_ago.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")), fetch=True
     )
     total = total_rows[0][0] if total_rows else 0
 
     present_rows = await execute_query(
         "SELECT COUNT(*) FROM attendance WHERE user_id = ? AND date BETWEEN ? AND ? AND status = 'present'",
-        (message.from_user.id, month_ago, today), fetch=True
+        (message.from_user.id, month_ago.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")), fetch=True
     )
     present = present_rows[0][0] if present_rows else 0
     
@@ -593,7 +613,7 @@ async def handle_date(message: types.Message):
         date = datetime.datetime.strptime(message.text, "%d.%m.%Y").date()
         result = await execute_query(
             "SELECT status, reason FROM attendance WHERE user_id = ? AND date = ?",
-            (message.from_user.id, date), fetch=True
+            (message.from_user.id, date.strftime("%Y-%m-%d")), fetch=True
         )
         
         if not result:
@@ -633,7 +653,7 @@ async def cmd_birthday(message: types.Message):
 
     try:
         birth_date = datetime.datetime.strptime(date_str, "%d.%m").date()
-        birth_date = birth_date.replace(year=2000)  # только для хранения дня/месяца
+        birth_date = birth_date.replace(year=2000)
     except ValueError:
         await message.answer("Неверный формат даты. Используй: ДД.ММ")
         return
@@ -729,7 +749,7 @@ async def process_reason(message: types.Message, state: FSMContext):
     today = datetime.date.today()
     await execute_query(
         "INSERT OR REPLACE INTO attendance (user_id, date, status, reason, marked_by) VALUES (?, ?, ?, ?, ?)",
-        (message.from_user.id, today, 'absent', message.text, message.from_user.id)
+        (message.from_user.id, today.strftime("%Y-%m-%d"), 'absent', message.text, message.from_user.id)
     )
     
     await message.answer(f"✅ Причина: **{message.text}**", reply_markup=types.ReplyKeyboardRemove(), parse_mode="Markdown")
@@ -796,14 +816,12 @@ async def shutdown(signal, loop):
 async def main():
     loop = asyncio.get_running_loop()
     
-    # Регистрация обработчиков сигналов
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(
             sig,
             lambda s=sig: asyncio.create_task(shutdown(s, loop))
         )
     
-    # Запускаем веб-сервер и бота параллельно
     await asyncio.gather(
         web_server(),
         run_bot(),
@@ -817,4 +835,4 @@ if __name__ == "__main__":
         logger.info("Бот остановлен вручную")
     except Exception as e:
         logger.exception(f"Критическая ошибка: {e}")
-        raise                                                                                       
+        raise
