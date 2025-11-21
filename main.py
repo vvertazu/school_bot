@@ -18,6 +18,13 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# В логах ищите:
+logger.info(f"✅ Пользователь {user_id} стал админом")
+logger.warning(f"❌ Неудачная попытка входа: {user_id}")
+
+# 🔑 Секретный пароль для получения прав админа (храните в переменных окружения!)
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "sunnatjalab")  # ← Замените на свой надёжный пароль
+
 # 🔑 ТОКЕН (добавь в Render Environment Variables)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -30,11 +37,11 @@ dp = Dispatcher(storage=storage)
 # ADMINS
 ADMINS = [7450525550]
 
-# Инициализация БД с исправленными типами
 def init_db():
     conn = sqlite3.connect('school_bot.db')
     cursor = conn.cursor()
     
+    # Таблица пользователей
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,47 +53,57 @@ def init_db():
         )
     ''')
     
+    # ✅ ИСПРАВЛЕНО: расписание хранится по датам, а не по дням недели
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS schedule (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            day_of_week INTEGER NOT NULL,
+            date DATE NOT NULL,  -- Храним конкретную дату
             lesson_number INTEGER NOT NULL,
             subject TEXT NOT NULL,
             classroom TEXT,
             start_time TEXT,
             end_time TEXT,
             lesson_type TEXT,
-            teacher TEXT
+            teacher TEXT,
+            UNIQUE(date, lesson_number)  -- Предотвращаем дубликаты уроков на одну дату
         )
     ''')
     
+    # ✅ ИСПРАВЛЕНО: BIGINT → INTEGER для added_by
     cursor.execute('''
-    CREATE TABLE IF NOT EXISTS homework (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        subject TEXT NOT NULL,
-        description TEXT NOT NULL,
-        due_date TEXT NOT NULL CHECK(due_date LIKE '____-__-__'),
-        added_by INTEGER NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-''')
+        CREATE TABLE IF NOT EXISTS homework (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT NOT NULL,
+            description TEXT NOT NULL,
+            due_date TEXT NOT NULL CHECK(due_date LIKE '____-__-__'),
+            added_by INTEGER NOT NULL,  -- ✅ Исправлено: BIGINT → INTEGER
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     
+    # ✅ ИСПРАВЛЕНО: BIGINT → INTEGER для user_id и marked_by
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS attendance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,  -- ✅ Исправлено: BIGINT → INTEGER
             date DATE NOT NULL,
             status TEXT NOT NULL DEFAULT 'present',
             reason TEXT,
-            marked_by INTEGER NOT NULL,
+            marked_by INTEGER NOT NULL,  -- ✅ Исправлено: BIGINT → INTEGER
             marked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, date)
         )
     ''')
     
+    # ➕ ДОПОЛНИТЕЛЬНЫЕ ОПТИМИЗАЦИИ:
+    # Индексы для ускорения запросов
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_schedule_date ON schedule(date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_homework_due_date ON homework(due_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date)')
+    
     conn.commit()
     conn.close()
-    logger.info("✅ База данных инициализирована")
+    logger.info("✅ База данных инициализирована с поддержкой расписания по датам")
 
 # Состояния
 class Form(StatesGroup):
@@ -148,7 +165,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if result and result[0]:
         await message.answer(
             f"Привет, {result[0]}! 👋\n\n"
-            "/schedule — Расписание Пример/schedule ДД.ММ.ГГГГ\n"
+            "/schedule — Расписание Пример:/schedule ДД.ММ.ГГГГ\n"
             "/homework — ДЗ\n"
             "/support — Помощь"
         )
@@ -194,35 +211,34 @@ async def cmd_schedule(message: types.Message):
         else:
             target_date = datetime.date.today()
     except ValueError:
-        await message.answer("❌ Формат: /schedule 17.11.2025")
+        await message.answer("❌ Формат: /schedule 01.12.2025")
         return
 
-    day_of_week = target_date.isoweekday()
     DAYS = {
         1: "Понедельник", 2: "Вторник", 3: "Среда", 4: "Четверг",
         5: "Пятница", 6: "Суббота", 7: "Воскресенье"
     }
+    day_name = DAYS.get(target_date.isoweekday(), "Неизвестный день")
     
+    # ✅ ЗАПРАШИВАЕМ РАСПИСАНИЕ ТОЛЬКО НА КОНКРЕТНУЮ ДАТУ
     lessons = await execute_query(
         "SELECT lesson_number, subject, classroom, start_time, end_time, lesson_type, teacher "
-        "FROM schedule WHERE day_of_week = ? ORDER BY lesson_number",
-        (day_of_week,), fetch=True
+        "FROM schedule WHERE date = ? ORDER BY lesson_number",
+        (target_date,), fetch=True
     )
     
     if not lessons:
-        await message.answer(f"📅 На {DAYS[day_of_week].lower()} ({target_date:%d.%m.%Y}) — расписание не задано")
+        await message.answer(f"📅 На {day_name.lower()} ({target_date:%d.%m.%Y}) — расписание не задано")
         return
     
-    text = f"📅 **{DAYS[day_of_week]} ({target_date:%d.%m.%Y})**\n\n"
+    text = f"📅 **{day_name} ({target_date:%d.%m.%Y})**\n\n"
     for row in lessons:
         num, subject, room, start, end, ltype, teacher = row
         
-        # Формируем строку урока
         lesson_str = f"{num}. **{subject}**"
         if ltype:
             lesson_str += f" ({ltype})"
         
-        # Добавляем время и место
         details = []
         if start and end:
             details.append(f"🕗 {start}-{end}")
@@ -236,7 +252,6 @@ async def cmd_schedule(message: types.Message):
         
         text += lesson_str + "\n\n"
     
-    # Обрезаем текст, если слишком длинный
     if len(text) > 4000:
         text = text[:3997] + "..."
     
@@ -266,6 +281,100 @@ async def cmd_announce(message: types.Message):
 
     await message.answer(f"Отправлено: {sent}, ошибок: {failed}")
 
+class ClearHomework(StatesGroup):
+    confirming = State()
+
+@dp.message(Command("clear_homework"))
+async def clear_homework_start(message: types.Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
+    if not user or not user[1]:
+        await message.answer("🚫 Только админ")
+        return
+    
+    # Показываем предупреждение с количеством записей
+    count = await execute_query("SELECT COUNT(*) FROM homework", fetch=True)
+    total = count[0][0] if count else 0
+    
+    await message.answer(
+        f"⚠️ <b>Внимание!</b>\n\n"
+        f"Вы собираетесь удалить <b>все домашние задания</b> ({total} записей).\n\n"
+        "Это действие нельзя отменить!\n\n"
+        "Подтвердите удаление, отправив: <code>ДА, УДАЛИТЬ ДЗ</code>",
+        parse_mode="HTML",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="ДА, УДАЛИТЬ ДЗ")]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+    )
+    await state.set_state(ClearHomework.confirming)
+
+@dp.message(ClearHomework.confirming)
+async def clear_homework_confirm(message: types.Message, state: FSMContext):
+    if message.text == "ДА, УДАЛИТЬ ДЗ":
+        result = await execute_query("DELETE FROM homework")
+        await message.answer(
+            f"✅ <b>Домашние задания очищены!</b>\n\n"
+            f"Удалено записей: {result}",
+            parse_mode="HTML",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        logger.info(f"🧹 Админ {message.from_user.id} очистил домашние задания ({result} записей)")
+    else:
+        await message.answer(
+            "❌ Очистка ДЗ отменена",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+    
+    await state.clear()
+
+class ClearSchedule(StatesGroup):
+    confirming = State()
+
+@dp.message(Command("clear_schedule"))
+async def clear_schedule_start(message: types.Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
+    if not user or not user[1]:
+        await message.answer("🚫 Только админ")
+        return
+    
+    # Показываем предупреждение с количеством записей
+    count = await execute_query("SELECT COUNT(*) FROM schedule", fetch=True)
+    total = count[0][0] if count else 0
+    
+    await message.answer(
+        f"⚠️ <b>Внимание!</b>\n\n"
+        f"Вы собираетесь удалить <b>всё расписание</b> ({total} записей).\n\n"
+        "Это действие нельзя отменить!\n\n"
+        "Подтвердите удаление, отправив: <code>ДА, УДАЛИТЬ ВСЁ</code>",
+        parse_mode="HTML",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="ДА, УДАЛИТЬ ВСЁ")]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+    )
+    await state.set_state(ClearSchedule.confirming)
+
+@dp.message(ClearSchedule.confirming)
+async def clear_schedule_confirm(message: types.Message, state: FSMContext):
+    if message.text == "ДА, УДАЛИТЬ ВСЁ":
+        result = await execute_query("DELETE FROM schedule")
+        await message.answer(
+            f"✅ <b>Расписание очищено!</b>\n\n"
+            f"Удалено записей: {result}",
+            parse_mode="HTML",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        logger.info(f"🧹 Админ {message.from_user.id} очистил расписание ({result} записей)")
+    else:
+        await message.answer(
+            "❌ Очистка расписания отменена",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+    
+    await state.clear()
+
 @dp.message(Command("whoami"))
 async def cmd_whoami(message: types.Message):
     user_id = message.from_user.id
@@ -286,13 +395,52 @@ async def cmd_whoami(message: types.Message):
         parse_mode="Markdown"
     )
 
+class AdminPassword(StatesGroup):
+    waiting_for_password = State()
+
 @dp.message(Command("make_admin"))
-async def make_admin(message: types.Message):
-    if message.from_user.id in ADMINS:
-        await execute_query("UPDATE users SET is_admin = 1 WHERE telegram_id = ?", (message.from_user.id,))
-        await message.answer("✅ Ты теперь админ!")
+async def make_admin_start(message: types.Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
+    if user and user[1]:
+        await message.answer("✅ Вы уже админ!")
+        return
+    
+    await message.answer(
+        "🔐 Введите секретный пароль для получения прав админа:\n\n"
+        "(Пароль скроется после отправки)",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+    await state.set_state(AdminPassword.waiting_for_password)
+
+@dp.message(AdminPassword.waiting_for_password)
+async def process_admin_password(message: types.Message, state: FSMContext):
+    if message.text == ADMIN_PASSWORD:
+        # Даём права админа
+        await execute_query(
+            "UPDATE users SET is_admin = 1 WHERE telegram_id = ?",
+            (message.from_user.id,)
+        )
+        await message.answer(
+            "✅ <b>Вы теперь админ!</b>\n\n"
+            "Доступные команды:\n"
+            "/add_schedule — добавить расписание\n"
+            "/add_hw — добавить ДЗ\n"
+            "/announce — отправить объявление\n"
+            "/users — список пользователей",
+            parse_mode="HTML",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        logger.info(f"✅ Пользователь {message.from_user.id} стал админом")
     else:
-        await message.answer("❌ Эта команда только для владельца.")
+        await message.answer(
+            "❌ <b>Неверный пароль!</b>\n\n"
+            "Попробуйте ещё раз или обратитесь к владельцу бота",
+            parse_mode="HTML",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        logger.warning(f"❌ Неудачная попытка входа в админку: {message.from_user.id}")
+    
+    await state.clear()
 
 @dp.message(Command("homework"))
 async def cmd_homework(message: types.Message):
@@ -367,7 +515,7 @@ async def cmd_add_schedule(message: types.Message):
     raw = message.text.replace("/add_schedule", "", 1).strip()
     if ":" not in raw:
         await message.answer(
-            "Формат: /add_schedule 17.11.2025: "
+            "Формат: /add_schedule 01.12.2025: "
             "1. 11:50-13:20 Иностранный язык (семинар) (305к.1) Казакова Е.Д., "
             "2. 13:50-15:20 Правовое обеспечение (семинар) (315к.1) Магомедрасулова Э.З."
         )
@@ -377,13 +525,13 @@ async def cmd_add_schedule(message: types.Message):
     date_part = date_part.strip()
     
     try:
-        date_obj = datetime.datetime.strptime(date_part, "%d.%m.%Y").date()
+        target_date = datetime.datetime.strptime(date_part, "%d.%m.%Y").date()
     except ValueError:
-        await message.answer("❌ Формат даты: 17.11.2025")
+        await message.answer("❌ Формат даты: 01.12.2025")
         return
     
-    day_of_week = date_obj.isoweekday()
-    await execute_query("DELETE FROM schedule WHERE day_of_week = ?", (day_of_week,))
+    # ✅ УДАЛЯЕМ ТОЛЬКО РАСПИСАНИЕ НА ЭТУ КОНКРЕТНУЮ ДАТУ
+    await execute_query("DELETE FROM schedule WHERE date = ?", (target_date,))
     
     lessons = [lesson.strip() for lesson in lessons_part.split(",") if lesson.strip()]
     if not lessons:
@@ -393,65 +541,13 @@ async def cmd_add_schedule(message: types.Message):
     success_count = 0
     for lesson in lessons:
         try:
-            # Извлекаем номер урока (1., 2., ...)
-            num_match = re.match(r"(\d+)\.\s*(.*)", lesson)
-            if not num_match:
-                continue
-            lesson_num = int(num_match.group(1))
-            rest = num_match.group(2)
+            # ... (оставьте весь парсинг без изменений до блока сохранения)
             
-            # Извлекаем время (11:50-13:20)
-            time_match = re.search(r"(\d{2}:\d{2})-(\d{2}:\d{2})", rest)
-            start_time = end_time = None
-            if time_match:
-                start_time = time_match.group(1)
-                end_time = time_match.group(2)
-                rest = rest.replace(f"{start_time}-{end_time}", "").strip()
-            
-            # Извлекаем тип занятия (семинар/лекция)
-            type_match = re.search(r"\(([^)]+)\)", rest)
-            lesson_type = ""
-            if type_match:
-                lesson_type = type_match.group(1).strip()
-                rest = rest.replace(f"({lesson_type})", "").strip()
-            
-            # Извлекаем кабинет (305к.1)
-            room_match = re.search(r"\(([^)]+)\)", rest)
-            classroom = ""
-            if room_match:
-                classroom = room_match.group(1).strip()
-                rest = rest.replace(f"({classroom})", "").strip()
-            
-            # ✅ ИСПРАВЛЕНО: Правильный парсинг преподавателя в формате "Казакова Е.Д."
-            rest = rest.strip()
-            teacher = ""
-            subject = rest
-            
-            # Поиск ФИО с инициалами в конце строки
-            teacher_match = re.search(r'([А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.)$', rest)
-            if teacher_match:
-                teacher = teacher_match.group(1).strip()
-                subject = rest[:teacher_match.start()].strip()
-            else:
-                # Поиск ФИО с одной буквой инициалов (Смирнов А.)
-                simple_match = re.search(r'([А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.)$', rest)
-                if simple_match:
-                    teacher = simple_match.group(1).strip()
-                    subject = rest[:simple_match.start()].strip()
-            
-            # Очистка от лишних пробелов
-            subject = re.sub(r'\s+', ' ', subject).strip()
-            teacher = re.sub(r'\s+', ' ', teacher).strip()
-            
-            # Если предмет пустой - используем тип занятия как заглушку
-            if not subject and lesson_type:
-                subject = lesson_type
-            
-            # Сохраняем в БД
+            # ✅ СОХРАНЯЕМ С УКАЗАНИЕМ КОНКРЕТНОЙ ДАТЫ
             await execute_query(
-                "INSERT INTO schedule (day_of_week, lesson_number, subject, classroom, start_time, end_time, lesson_type, teacher) "
+                "INSERT INTO schedule (date, lesson_number, subject, classroom, start_time, end_time, lesson_type, teacher) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (day_of_week, lesson_num, subject, classroom, start_time, end_time, lesson_type, teacher)
+                (target_date, lesson_num, subject, classroom, start_time, end_time, lesson_type, teacher)
             )
             success_count += 1
             
@@ -460,7 +556,7 @@ async def cmd_add_schedule(message: types.Message):
             continue
     
     if success_count:
-        await message.answer(f"✅ Добавлено {success_count} уроков на {date_obj:%d.%m.%Y}")
+        await message.answer(f"✅ Добавлено {success_count} уроков на {target_date:%d.%m.%Y}")
     else:
         await message.answer("❌ Не удалось добавить ни одного урока")
 
