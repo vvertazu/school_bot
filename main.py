@@ -196,6 +196,34 @@ async def cmd_support(message: types.Message):
         parse_mode="Markdown"
     )
 
+@dp.message(Command("change_fio"))
+async def cmd_change_fio(message: types.Message, state: FSMContext):
+    await message.answer("✏️ Введите новое **ФИО полностью**", parse_mode="Markdown")
+    await state.set_state(Form.waiting_for_fio)
+
+# (Замени существующий handler Form.waiting_for_fio на этот):
+@dp.message(Form.waiting_for_fio)
+async def process_fio(message: types.Message, state: FSMContext):
+    fio = message.text.strip()
+    if len(fio) < 5:
+        await message.answer("❌ ФИО слишком короткое. Попробуй ещё:")
+        return
+    
+    await execute_query(
+        "UPDATE users SET full_name = ? WHERE telegram_id = ?",
+        (fio, message.from_user.id)
+    )
+    
+    # Проверяем, откуда пришёл пользователь (регистрация или изменение)
+    current_state = await state.get_state()
+    if current_state == "Form:waiting_for_fio":
+        action = "сохранено" if not (await get_user(message.from_user.id))[0] else "обновлено"
+    else:
+        action = "обновлено"
+    
+    await message.answer(f"✅ ФИО {action}: **{fio}**", parse_mode="Markdown")
+    await state.clear()
+
 @dp.message(Command("schedule"))
 async def cmd_schedule(message: types.Message):
     raw = message.text.replace("/schedule", "", 1).strip()
