@@ -13,6 +13,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +24,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "sunnatjalab")
 SUPER_ADMINS = [7450525550]  # ← Ваш ID
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME', 'your-service.onrender.com')}{WEBHOOK_PATH}"
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не установлен в переменных окружения!")
@@ -794,47 +797,53 @@ async def birthday_task():
             except Exception as e:
                 logger.error(f"Не удалось поздравить {tg_id}: {e}")
 
-# ВЕБ-СЕРВЕР ДЛЯ RENDER
-async def health_check(request):
-    return web.Response(text="OK")
-
-async def web_server():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"Веб-сервер запущен на порту {port}")
-
-async def run_bot():
+# ВЕБ-СЕРВЕР ДЛЯ RENDER (ВЕБХУК-РЕЖИМ)
+async def on_startup(app):
+    # Удаляем старый webhook (на всякий случай)
+    await bot.delete_webhook(drop_pending_updates=True)
+    # Устанавливаем новый webhook
+    await bot.set_webhook(WEBHOOK_URL)
+    logger.info(f"✅ Webhook установлен на {WEBHOOK_URL}")
+    # Инициализируем БД
     init_db()
-    logger.info("Бот запущен!")
-    await dp.start_polling(bot)
+    logger.info("✅ База данных инициализирована")
 
-# Обработка SIGTERM для Render
-async def shutdown(signal, loop):
-    logger.info(f"Получен сигнал {signal.name}...")
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    [task.cancel() for task in tasks]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    loop.stop()
+async def on_shutdown(app):
+    # Удаляем webhook при остановке
+    await bot.delete_webhook()
+    logger.info("✅ Webhook удален при остановке")
 
 async def main():
-    loop = asyncio.get_running_loop()
+    # Создаем веб-приложение
+    app = web.Application()
     
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(
-            sig,
-            lambda s=sig: asyncio.create_task(shutdown(s, loop))
-        )
+    # Регистрируем обработчик для webhook
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    ).register(app, path=WEBHOOK_PATH)
     
-    await asyncio.gather(
-        web_server(),
-        run_bot(),
-        birthday_task()
-    )
+    # Регистрируем обработчик для health-check
+    app.router.add_get("/", lambda request: web.Response(text="OK"))
+    
+    # Регистрируем события запуска и остановки
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    
+    # Запускаем веб-сервер
+    port = int(os.getenv("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    logger.info(f"🚀 Веб-сервер запущен на порту {port}")
+    await site.start()
+    
+    # Запускаем задачу для поздравлений с ДР в фоне
+    asyncio.create_task(birthday_task())
+    
+    # Бесконечно ждем
+    while True:
+        await asyncio.sleep(3600)  # Спим час и проверяем
 
 if __name__ == "__main__":
     try:
