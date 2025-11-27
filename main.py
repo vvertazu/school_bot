@@ -72,7 +72,7 @@ def init_db():
             id SERIAL PRIMARY KEY,
             subject TEXT NOT NULL,
             description TEXT NOT NULL,
-            due_date TEXT NOT NULL CHECK(due_date ~ '^\d{4}-\d{2}-\d{2}$'),
+            due_date TEXT NOT NULL CHECK(due_date ~ '^\\d{4}-\\d{2}-\\d{2}$'),
             added_by BIGINT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
