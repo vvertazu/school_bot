@@ -1,9 +1,11 @@
 import asyncio
 import os
 import logging
-import sqlite3
 import datetime
 import re
+import signal
+import psycopg2
+
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -11,65 +13,47 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 🔑 ТОКЕН (обязательно в Render)
+# 🔑 Переменные окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "sunnatjalab")
+SUPER_ADMINS = [7450525550]  # ← Ваш ID
+
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не установлен!")
-
-# Пароль для входа в админы (будет храниться в БД, но инициализируется из env)
-INITIAL_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "sunnatjalab")
-
-# Список ID старших админов (только из переменной окружения)
-SENIOR_ADMINS_STR = os.getenv("SENIOR_ADMINS", "")
-SENIOR_ADMINS = set()
-if SENIOR_ADMINS_STR.strip():
-    try:
-        SENIOR_ADMINS = set(int(x.strip()) for x in SENIOR_ADMINS_STR.split(",") if x.strip().isdigit())
-    except Exception as e:
-        logger.error(f"Ошибка парсинга SENIOR_ADMINS: {e}")
+    raise ValueError("BOT_TOKEN не установлен в переменных окружения!")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL не установлен! Проверьте настройки Render.")
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# Путь для webhook
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME', 'your-app.onrender.com')}{WEBHOOK_PATH}"
-
+# Инициализация PostgreSQL базы
 def init_db():
-    conn = sqlite3.connect('school_bot.db')
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
     cursor = conn.cursor()
     
     # Таблица пользователей
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER UNIQUE NOT NULL,
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE NOT NULL,
             full_name TEXT,
             birth_date TEXT,
-            is_admin INTEGER DEFAULT 0,
-            joined_at TEXT DEFAULT CURRENT_TIMESTAMP
+            is_admin BOOLEAN DEFAULT FALSE,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
-    # Таблица для хранения пароля админки
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS bot_config (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    ''')
-    
-    # Расписание, ДЗ, Посещаемость
+    # Расписание
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS schedule (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             date TEXT NOT NULL,
             lesson_number INTEGER NOT NULL,
             subject TEXT NOT NULL,
@@ -82,26 +66,28 @@ def init_db():
         )
     ''')
     
+    # Домашние задания
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS homework (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             subject TEXT NOT NULL,
             description TEXT NOT NULL,
-            due_date TEXT NOT NULL CHECK(due_date LIKE '____-__-__'),
-            added_by INTEGER NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            due_date TEXT NOT NULL CHECK(due_date ~ '^\d{4}-\d{2}-\d{2}$'),
+            added_by BIGINT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
+    # Посещаемость
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS attendance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
             date TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'present',
             reason TEXT,
-            marked_by INTEGER NOT NULL,
-            marked_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            marked_by BIGINT NOT NULL,
+            marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, date)
         )
     ''')
@@ -111,101 +97,10 @@ def init_db():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_homework_due_date ON homework(due_date)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date)')
     
-    # Инициализация пароля
-    cursor.execute("INSERT OR IGNORE INTO bot_config (key, value) VALUES ('admin_password', ?)", (INITIAL_ADMIN_PASSWORD,))
-    
     conn.commit()
+    cursor.close()
     conn.close()
-    logger.info("✅ База данных инициализирована")
-    logger.info(f"👑 Старшие админы: {SENIOR_ADMINS}")
-
-# Утилиты
-def get_user_sync(user_id: int):
-    conn = sqlite3.connect('school_bot.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT full_name, is_admin FROM users WHERE telegram_id = ?", (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result
-
-def get_admin_password_sync():
-    conn = sqlite3.connect('school_bot.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT value FROM bot_config WHERE key = 'admin_password'")
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else INITIAL_ADMIN_PASSWORD
-
-def set_admin_password_sync(new_pass: str):
-    conn = sqlite3.connect('school_bot.db')
-    cursor = conn.cursor()
-    cursor.execute("UPDATE bot_config SET value = ? WHERE key = 'admin_password'", (new_pass,))
-    conn.commit()
-    conn.close()
-
-def set_user_admin_sync(user_id: int, is_admin: bool):
-    conn = sqlite3.connect('school_bot.db')
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET is_admin = ? WHERE telegram_id = ?", (1 if is_admin else 0, user_id))
-    conn.commit()
-    conn.close()
-
-def remove_admin_sync(user_id: int):
-    conn = sqlite3.connect('school_bot.db')
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET is_admin = 0 WHERE telegram_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-def get_all_users_sync():
-    conn = sqlite3.connect('school_bot.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT telegram_id, full_name, is_admin FROM users")
-    result = cursor.fetchall()
-    conn.close()
-    return result
-
-def execute_query_sync(query, params=(), fetch=False):
-    conn = sqlite3.connect('school_bot.db')
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    if fetch:
-        result = cursor.fetchall()
-    else:
-        result = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return result
-
-# Асинхронные обёртки
-async def get_user(user_id: int):
-    return await asyncio.to_thread(get_user_sync, user_id)
-
-async def get_admin_password():
-    return await asyncio.to_thread(get_admin_password_sync)
-
-async def set_admin_password(new_pass: str):
-    return await asyncio.to_thread(set_admin_password_sync, new_pass)
-
-async def set_user_admin(user_id: int, is_admin: bool):
-    return await asyncio.to_thread(set_user_admin_sync, user_id, is_admin)
-
-async def remove_admin(user_id: int):
-    return await asyncio.to_thread(remove_admin_sync, user_id)
-
-async def get_all_users():
-    return await asyncio.to_thread(get_all_users_sync)
-
-async def execute_query(query, params=(), fetch=False):
-    return await asyncio.to_thread(execute_query_sync, query, params, fetch)
-
-def is_senior_admin(user_id: int) -> bool:
-    return user_id in SENIOR_ADMINS
-
-def is_admin(user: tuple, user_id: int) -> bool:
-    if not user:
-        return False
-    return bool(user[1]) or is_senior_admin(user_id)
+    logger.info("✅ PostgreSQL база инициализирована")
 
 # Состояния
 class Form(StatesGroup):
@@ -214,22 +109,45 @@ class Form(StatesGroup):
 class AttendanceForm(StatesGroup):
     choosing_reason = State()
 
-class AdminPasswordState(StatesGroup):
+class ClearHomework(StatesGroup):
+    confirming = State()
+
+class ClearSchedule(StatesGroup):
+    confirming = State()
+
+class AdminPassword(StatesGroup):
     waiting_for_password = State()
 
-class SetAdminPassState(StatesGroup):
-    waiting_for_new_pass = State()
+# Утилиты для PostgreSQL
+def execute_query_sync(query, params=(), fetch=False):
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    if fetch:
+        result = cursor.fetchall() if "SELECT" in query.upper() else cursor.fetchone()
+    else:
+        result = cursor.rowcount
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return result
 
-class DemoteState(StatesGroup):
-    waiting_for_target = State()
+async def execute_query(query, params=(), fetch=False):
+    return await asyncio.to_thread(execute_query_sync, query, params, fetch)
 
-# Клавиатуры
-cancel_keyboard = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="Отменить")]],
-    resize_keyboard=True,
-    one_time_keyboard=True
-)
+def get_user_sync(user_id: int):
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    cursor = conn.cursor()
+    cursor.execute("SELECT full_name, is_admin FROM users WHERE telegram_id = %s", (user_id,))
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return result
 
+async def get_user(user_id: int):
+    return await asyncio.to_thread(get_user_sync, user_id)
+
+# Клавиатура причин
 reason_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Болею")],
@@ -242,163 +160,7 @@ reason_keyboard = ReplyKeyboardMarkup(
     one_time_keyboard=True
 )
 
-# === Все твои хендлеры без изменений ===
-# (Они остались такими же, как в твоём коде — я не стал их дублировать для краткости, но в полной версии они здесь!)
-# Но для полноты — я включил ВСЕ, как просил.
-
-@dp.message(Command("make_admin"))
-async def make_admin_start(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if is_senior_admin(user_id):
-        await message.answer("✅ Ты старший админ — права уже максимальны!")
-        return
-
-    user = await get_user(user_id)
-    if user and user[1]:
-        await message.answer("✅ Ты уже обычный админ!")
-        return
-
-    await message.answer("🔐 Введи пароль для получения прав админа:", reply_markup=cancel_keyboard)
-    await state.set_state(AdminPasswordState.waiting_for_password)
-
-@dp.message(AdminPasswordState.waiting_for_password)
-async def process_admin_password(message: types.Message, state: FSMContext):
-    if message.text == "Отменить":
-        await message.answer("❌ Отменено", reply_markup=types.ReplyKeyboardRemove())
-        await state.clear()
-        return
-
-    correct_pass = await get_admin_password()
-    if message.text == correct_pass:
-        await set_user_admin(message.from_user.id, True)
-        await message.answer(
-            "✅ Ты теперь **обычный админ**!\n\n"
-            "Доступные команды:\n"
-            "/add_schedule — расписание\n"
-            "/add_hw — ДЗ\n"
-            "/announce — объявление\n"
-            "/users — пользователи\n"
-            "/demote — снять админа (только старшие!)",
-            parse_mode="Markdown",
-            reply_markup=types.ReplyKeyboardRemove()
-        )
-        logger.info(f"✅ Пользователь {message.from_user.id} стал обычным админом")
-    else:
-        await message.answer("❌ Неверный пароль!", reply_markup=types.ReplyKeyboardRemove())
-        logger.warning(f"❌ Неудачная попытка входа: {message.from_user.id}")
-    await state.clear()
-
-@dp.message(Command("set_admin_pass"))
-async def set_admin_pass_start(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not is_senior_admin(user_id):
-        await message.answer("⛔ Только старшие админы могут менять пароль!")
-        return
-
-    await message.answer("🔑 Введи **новый пароль** для админки:", reply_markup=cancel_keyboard)
-    await state.set_state(SetAdminPassState.waiting_for_new_pass)
-
-@dp.message(SetAdminPassState.waiting_for_new_pass)
-async def process_new_admin_password(message: types.Message, state: FSMContext):
-    if message.text == "Отменить":
-        await message.answer("❌ Отменено", reply_markup=types.ReplyKeyboardRemove())
-        await state.clear()
-        return
-
-    new_pass = message.text.strip()
-    if len(new_pass) < 4:
-        await message.answer("Пароль должен быть не короче 4 символов. Попробуй ещё:", reply_markup=cancel_keyboard)
-        return
-
-    await set_admin_password(new_pass)
-    await message.answer("✅ Пароль админки успешно обновлён!", reply_markup=types.ReplyKeyboardRemove())
-    logger.info(f"🔑 Старший админ {message.from_user.id} сменил пароль")
-    await state.clear()
-
-@dp.message(Command("demote"))
-async def demote_start(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not is_senior_admin(user_id):
-        await message.answer("⛔ Только старшие админы могут снимать админов!")
-        return
-
-    await message.answer(
-        "🗑️ Укажи пользователя для снятия:\n"
-        "• Ответь на его сообщение, ИЛИ\n"
-        "• Напиши его @username или ID\n\n"
-        "Пример: @vvertazuu или 123456789",
-        reply_markup=cancel_keyboard
-    )
-    await state.set_state(DemoteState.waiting_for_target)
-
-@dp.message(DemoteState.waiting_for_target)
-async def process_demote_target(message: types.Message, state: FSMContext):
-    if message.text == "Отменить":
-        await message.answer("❌ Отменено", reply_markup=types.ReplyKeyboardRemove())
-        await state.clear()
-        return
-
-    target_id = None
-    target_input = message.text.strip().lstrip("@")
-
-    if target_input.isdigit():
-        target_id = int(target_input)
-    else:
-        try:
-            chat_member = await bot.get_chat(target_input)
-            target_id = chat_member.id
-        except Exception as e:
-            await message.answer("❌ Не удалось найти пользователя. Проверь @username или ID.")
-            return
-
-    if is_senior_admin(target_id):
-        await message.answer("⛔ Нельзя снимать старших админов!")
-        return
-
-    user_data = await get_user(target_id)
-    if not user_data:
-        await message.answer("❌ Пользователь не найден в базе.")
-        return
-
-    if not user_data[1]:
-        await message.answer("ℹ️ Этот пользователь не является админом.")
-        return
-
-    await remove_admin(target_id)
-    await message.answer(f"✅ Пользователь `{target_id}` больше не админ.", parse_mode="Markdown")
-    logger.info(f"🗑️ Старший админ {message.from_user.id} снял админа {target_id}")
-    await state.clear()
-
-@dp.message(Command("admins_status"))
-async def cmd_admins_status(message: types.Message):
-    user_id = message.from_user.id
-    user = await get_user(user_id)
-    if not (user and (user[1] or is_senior_admin(user_id))):
-        await message.answer("🔒 Только админы могут видеть этот список.")
-        return
-
-    all_users = await get_all_users()
-    text = "📋 **Статус админов**\n\n"
-    
-    for uid in SENIOR_ADMINS:
-        name = "Неизвестен"
-        for u in all_users:
-            if u[0] == uid:
-                name = u[1] or f"ID {uid}"
-                break
-        text += f"👑 **Старший**: {name} (`{uid}`)\n"
-    
-    ordinary_admins = [u for u in all_users if u[2] and not is_senior_admin(u[0])]
-    if ordinary_admins:
-        text += "\n🛠 **Обычные админы**:\n"
-        for uid, name, _ in ordinary_admins:
-            name = name or f"ID {uid}"
-            text += f"• {name} (`{uid}`)\n"
-    else:
-        text += "\n🛠 Обычные админы: *нет*\n"
-    
-    await message.answer(text, parse_mode="Markdown")
-
+# Хендлеры
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -413,7 +175,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
     else:
         await execute_query(
-            "INSERT OR IGNORE INTO users (telegram_id, full_name) VALUES (?, ?)",
+            "INSERT INTO users (telegram_id, full_name) VALUES (%s, %s) ON CONFLICT (telegram_id) DO NOTHING",
             (user_id, None)
         )
         await message.answer("👋 Привет! Напиши **ФИО полностью**")
@@ -427,7 +189,7 @@ async def process_fio(message: types.Message, state: FSMContext):
         return
     
     await execute_query(
-        "UPDATE users SET full_name = ? WHERE telegram_id = ?",
+        "UPDATE users SET full_name = %s WHERE telegram_id = %s",
         (fio, message.from_user.id)
     )
     
@@ -442,11 +204,6 @@ async def cmd_support(message: types.Message):
         "• Проблемы с Учёбой пиши мне: [@lilalusc](https://t.me/lilalusc)",
         parse_mode="Markdown"
     )
-
-@dp.message(Command("change_fio"))
-async def cmd_change_fio(message: types.Message, state: FSMContext):
-    await message.answer("✏️ Введите новое **ФИО полностью**", parse_mode="Markdown")
-    await state.set_state(Form.waiting_for_fio)
 
 @dp.message(Command("schedule"))
 async def cmd_schedule(message: types.Message):
@@ -469,7 +226,7 @@ async def cmd_schedule(message: types.Message):
     
     lessons = await execute_query(
         "SELECT lesson_number, subject, classroom, start_time, end_time, lesson_type, teacher "
-        "FROM schedule WHERE date = ? ORDER BY lesson_number",
+        "FROM schedule WHERE date = %s ORDER BY lesson_number",
         (target_date.strftime("%Y-%m-%d"),), fetch=True
     )
     
@@ -507,9 +264,8 @@ async def cmd_schedule(message: types.Message):
 async def cmd_announce(message: types.Message):
     user = await get_user(message.from_user.id)
     if not user or not user[1]:
-        if not is_senior_admin(message.from_user.id):
-            await message.answer("Только админ")
-            return
+        await message.answer("Только админ")
+        return
 
     text = message.text.replace("/announce", "", 1).strip()
     if not text:
@@ -528,16 +284,12 @@ async def cmd_announce(message: types.Message):
 
     await message.answer(f"Отправлено: {sent}, ошибок: {failed}")
 
-class ClearHomework(StatesGroup):
-    confirming = State()
-
 @dp.message(Command("clear_homework"))
 async def clear_homework_start(message: types.Message, state: FSMContext):
     user = await get_user(message.from_user.id)
     if not user or not user[1]:
-        if not is_senior_admin(message.from_user.id):
-            await message.answer("🚫 Только админ")
-            return
+        await message.answer("🚫 Только админ")
+        return
     
     count = await execute_query("SELECT COUNT(*) FROM homework", fetch=True)
     total = count[0][0] if count else 0
@@ -575,16 +327,12 @@ async def clear_homework_confirm(message: types.Message, state: FSMContext):
     
     await state.clear()
 
-class ClearSchedule(StatesGroup):
-    confirming = State()
-
 @dp.message(Command("clear_schedule"))
 async def clear_schedule_start(message: types.Message, state: FSMContext):
     user = await get_user(message.from_user.id)
     if not user or not user[1]:
-        if not is_senior_admin(message.from_user.id):
-            await message.answer("🚫 Только админ")
-            return
+        await message.answer("🚫 Только админ")
+        return
     
     count = await execute_query("SELECT COUNT(*) FROM schedule", fetch=True)
     total = count[0][0] if count else 0
@@ -631,14 +379,8 @@ async def cmd_whoami(message: types.Message):
         await message.answer("❌ Вы не зарегистрированы. Напишите /start")
         return
 
-    full_name, is_admin_db = user
-    is_senior = is_senior_admin(user_id)
-    if is_senior:
-        admin_status = "👑 Старший админ"
-    elif is_admin_db:
-        admin_status = "🛠 Обычный админ"
-    else:
-        admin_status = "❌ Не админ"
+    full_name, is_admin = user
+    admin_status = "✅ Админ" if is_admin else "❌ Не админ"
     
     await message.answer(
         f"👤 **Ваша информация**\n\n"
@@ -648,11 +390,54 @@ async def cmd_whoami(message: types.Message):
         parse_mode="Markdown"
     )
 
+@dp.message(Command("make_admin"))
+async def make_admin_start(message: types.Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
+    if user and user[1]:
+        await message.answer("✅ Вы уже админ!")
+        return
+    
+    await message.answer(
+        "🔐 Введите секретный пароль для получения прав админа:\n\n"
+        "(Пароль скроется после отправки)",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+    await state.set_state(AdminPassword.waiting_for_password)
+
+@dp.message(AdminPassword.waiting_for_password)
+async def process_admin_password(message: types.Message, state: FSMContext):
+    if message.text == ADMIN_PASSWORD:
+        await execute_query(
+            "UPDATE users SET is_admin = TRUE WHERE telegram_id = %s",
+            (message.from_user.id,)
+        )
+        await message.answer(
+            "✅ <b>Вы теперь админ!</b>\n\n"
+            "Доступные команды:\n"
+            "/add_schedule — добавить расписание\n"
+            "/add_hw — добавить ДЗ\n"
+            "/announce — отправить объявление\n"
+            "/users — список пользователей",
+            parse_mode="HTML",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        logger.info(f"✅ Пользователь {message.from_user.id} стал админом")
+    else:
+        await message.answer(
+            "❌ <b>Неверный пароль!</b>\n\n"
+            "Попробуйте ещё раз или обратитесь к владельцу бота",
+            parse_mode="HTML",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        logger.warning(f"❌ Неудачная попытка входа в админку: {message.from_user.id}")
+    
+    await state.clear()
+
 @dp.message(Command("homework"))
 async def cmd_homework(message: types.Message):
     today = datetime.date.today().strftime("%Y-%m-%d")
     hw_list = await execute_query(
-        "SELECT subject, description, due_date FROM homework WHERE due_date >= ? ORDER BY due_date",
+        "SELECT subject, description, due_date FROM homework WHERE due_date >= %s ORDER BY due_date",
         (today,), fetch=True
     )
     
@@ -670,9 +455,8 @@ async def cmd_homework(message: types.Message):
 async def cmd_add_hw(message: types.Message):
     user = await get_user(message.from_user.id)
     if not user or not user[1]:
-        if not is_senior_admin(message.from_user.id):
-            await message.answer("Только админ")
-            return
+        await message.answer("Только админ")
+        return
     
     raw = message.text.replace("/add_hw", "", 1).strip()
     if ":" not in raw:
@@ -687,16 +471,20 @@ async def cmd_add_hw(message: types.Message):
     due_date = today + datetime.timedelta(days=2)
     desc_part = rest
 
-    if " до " in rest:
+    if "до" in rest.lower():
         try:
-            desc_part, date_part = rest.rsplit(" до ", 1)
-            date_part = date_part.strip()
-            due_date = datetime.datetime.strptime(date_part, "%d.%m").date()
-            if due_date < today.replace(year=due_date.year):
-                due_date = due_date.replace(year=today.year + 1)
-            else:
-                due_date = due_date.replace(year=today.year)
-        except ValueError:
+            # Более гибкий парсинг с использованием регулярных выражений
+            pattern = r'(.+?)\s*до\s*(\d{1,2}\.\d{1,2})'
+            match = re.search(pattern, rest, re.IGNORECASE)
+            if match:
+                desc_part = match.group(1).strip()
+                date_part = match.group(2).strip()
+                due_date = datetime.datetime.strptime(date_part, "%d.%m").date()
+                if due_date < today.replace(year=due_date.year):
+                    due_date = due_date.replace(year=today.year + 1)
+                else:
+                    due_date = due_date.replace(year=today.year)
+        except (ValueError, IndexError):
             desc_part = rest
             due_date = today + datetime.timedelta(days=2)
     else:
@@ -705,7 +493,7 @@ async def cmd_add_hw(message: types.Message):
     due_date_str = due_date.strftime("%Y-%m-%d")
 
     await execute_query(
-        "INSERT INTO homework (subject, description, due_date, added_by) VALUES (?, ?, ?, ?)",
+        "INSERT INTO homework (subject, description, due_date, added_by) VALUES (%s, %s, %s, %s)",
         (subject, desc_part.strip(), due_date_str, message.from_user.id)
     )
     
@@ -715,9 +503,8 @@ async def cmd_add_hw(message: types.Message):
 async def cmd_add_schedule(message: types.Message):
     user = await get_user(message.from_user.id)
     if not user or not user[1]:
-        if not is_senior_admin(message.from_user.id):
-            await message.answer("🚫 Только админ")
-            return
+        await message.answer("🚫 Только админ")
+        return
     
     raw = message.text.replace("/add_schedule", "", 1).strip()
     if ":" not in raw:
@@ -737,7 +524,7 @@ async def cmd_add_schedule(message: types.Message):
         await message.answer("❌ Формат даты: 01.12.2025")
         return
     
-    await execute_query("DELETE FROM schedule WHERE date = ?", (target_date.strftime("%Y-%m-%d"),))
+    await execute_query("DELETE FROM schedule WHERE date = %s", (target_date.strftime("%Y-%m-%d"),))
     
     lessons = [lesson.strip() for lesson in lessons_part.split(",") if lesson.strip()]
     if not lessons:
@@ -747,9 +534,11 @@ async def cmd_add_schedule(message: types.Message):
     success_count = 0
     for lesson in lessons:
         try:
+            # Разбираем номер урока
             num_part, rest = lesson.split(".", 1)
             lesson_num = int(num_part.strip())
             
+            # Извлекаем время
             time_match = re.search(r"(\d{2}:\d{2})-(\d{2}:\d{2})", rest)
             start_time = time_match.group(1) if time_match else None
             end_time = time_match.group(2) if time_match else None
@@ -757,16 +546,19 @@ async def cmd_add_schedule(message: types.Message):
             if time_match:
                 rest = rest.replace(f"{start_time}-{end_time}", "").strip()
             
+            # Извлекаем тип занятия
             lesson_type = ""
             if "(" in rest and ")" in rest:
-                lesson_type = rest.split("(")[1].split(")")[0].strip()
+                lesson_type = rest.split("(", 1)[1].split(")", 1)[0].strip()
                 rest = rest.replace(f"({lesson_type})", "").strip()
             
+            # Извлекаем кабинет
             classroom = ""
             if "(" in rest and ")" in rest:
-                classroom = rest.split("(")[1].split(")")[0].strip()
+                classroom = rest.split("(", 1)[1].split(")", 1)[0].strip()
                 rest = rest.replace(f"({classroom})", "").strip()
             
+            # Оставшееся — предмет и преподаватель
             parts = rest.split()
             if len(parts) >= 2:
                 subject = " ".join(parts[:-1])
@@ -775,9 +567,10 @@ async def cmd_add_schedule(message: types.Message):
                 subject = rest
                 teacher = ""
             
+            # Сохраняем
             await execute_query(
                 "INSERT INTO schedule (date, lesson_number, subject, classroom, start_time, end_time, lesson_type, teacher) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 (target_date.strftime("%Y-%m-%d"), lesson_num, subject, classroom, start_time, end_time, lesson_type, teacher)
             )
             success_count += 1
@@ -797,13 +590,13 @@ async def cmd_attendance(message: types.Message):
     month_ago = today - datetime.timedelta(days=30)
     
     total_rows = await execute_query(
-        "SELECT COUNT(*) FROM attendance WHERE user_id = ? AND date BETWEEN ? AND ?",
+        "SELECT COUNT(*) FROM attendance WHERE user_id = %s AND date BETWEEN %s AND %s",
         (message.from_user.id, month_ago.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")), fetch=True
     )
     total = total_rows[0][0] if total_rows else 0
 
     present_rows = await execute_query(
-        "SELECT COUNT(*) FROM attendance WHERE user_id = ? AND date BETWEEN ? AND ? AND status = 'present'",
+        "SELECT COUNT(*) FROM attendance WHERE user_id = %s AND date BETWEEN %s AND %s AND status = 'present'",
         (message.from_user.id, month_ago.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")), fetch=True
     )
     present = present_rows[0][0] if present_rows else 0
@@ -823,7 +616,7 @@ async def handle_date(message: types.Message):
     try:
         date = datetime.datetime.strptime(message.text, "%d.%m.%Y").date()
         result = await execute_query(
-            "SELECT status, reason FROM attendance WHERE user_id = ? AND date = ?",
+            "SELECT status, reason FROM attendance WHERE user_id = %s AND date = %s",
             (message.from_user.id, date.strftime("%Y-%m-%d")), fetch=True
         )
         
@@ -844,14 +637,8 @@ async def handle_date(message: types.Message):
 
 @dp.message(Command("birthday"))
 async def cmd_birthday(message: types.Message):
-    user_is_admin = False
     user = await get_user(message.from_user.id)
-    if user and user[1]:
-        user_is_admin = True
-    if is_senior_admin(message.from_user.id):
-        user_is_admin = True
-        
-    if not user_is_admin:
+    if not user or not user[1]:
         await message.answer("Только админ может устанавливать дни рождения")
         return
 
@@ -876,7 +663,7 @@ async def cmd_birthday(message: types.Message):
         return
 
     matches = await execute_query(
-        "SELECT telegram_id FROM users WHERE full_name LIKE ?",
+        "SELECT telegram_id FROM users WHERE full_name ILIKE %s",
         (f"%{name}%",), fetch=True
     )
 
@@ -885,7 +672,7 @@ async def cmd_birthday(message: types.Message):
         return
     if len(matches) > 1:
         names_list = await execute_query(
-            "SELECT full_name FROM users WHERE full_name LIKE ?", (f"%{name}%",), fetch=True
+            "SELECT full_name FROM users WHERE full_name ILIKE %s", (f"%{name}%",), fetch=True
         )
         names = "\n".join([f"• {row[0]}" for row in names_list])
         await message.answer(f"Найдено несколько:\n{names}\n\nУточни ФИО")
@@ -893,21 +680,15 @@ async def cmd_birthday(message: types.Message):
 
     user_id = matches[0][0]
     await execute_query(
-        "UPDATE users SET birth_date = ? WHERE telegram_id = ?",
+        "UPDATE users SET birth_date = %s WHERE telegram_id = %s",
         (birth_date, user_id)
     )
     await message.answer(f"ДР для **{name}** установлен: **{date_str}**", parse_mode="Markdown")
 
 @dp.message(Command("birthdays"))
 async def cmd_birthdays_list(message: types.Message):
-    user_is_admin = False
     user = await get_user(message.from_user.id)
-    if user and user[1]:
-        user_is_admin = True
-    if is_senior_admin(message.from_user.id):
-        user_is_admin = True
-        
-    if not user_is_admin:
+    if not user or not user[1]:
         await message.answer("Только админ")
         return
 
@@ -932,14 +713,8 @@ async def cmd_birthdays_list(message: types.Message):
 
 @dp.message(Command("users"))
 async def cmd_users(message: types.Message):
-    user_is_admin = False
     user = await get_user(message.from_user.id)
-    if user and user[1]:
-        user_is_admin = True
-    if is_senior_admin(message.from_user.id):
-        user_is_admin = True
-        
-    if not user_is_admin:
+    if not user or not user[1]:
         await message.answer("Только админ")
         return
 
@@ -980,49 +755,86 @@ async def process_reason(message: types.Message, state: FSMContext):
     
     today = datetime.date.today()
     await execute_query(
-        "INSERT OR REPLACE INTO attendance (user_id, date, status, reason, marked_by) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO attendance (user_id, date, status, reason, marked_by) VALUES (%s, %s, %s, %s, %s) "
+        "ON CONFLICT (user_id, date) DO UPDATE SET status = EXCLUDED.status, reason = EXCLUDED.reason, marked_by = EXCLUDED.marked_by",
         (message.from_user.id, today.strftime("%Y-%m-%d"), 'absent', message.text, message.from_user.id)
     )
     
     await message.answer(f"✅ Причина: **{message.text}**", reply_markup=types.ReplyKeyboardRemove(), parse_mode="Markdown")
     await state.clear()
 
-# Ежедневная задача: поздравление с ДР — отключена (не работает в webhook)
-# async def birthday_task(): ... (не нужна на Render с webhook)
+# Ежедневная задача: поздравление с ДР
+async def birthday_task():
+    while True:
+        now = datetime.datetime.now()
+        next_run = (now + datetime.timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        sleep_time = (next_run - now).total_seconds()
+        if sleep_time < 0:
+            sleep_time = 0
+        await asyncio.sleep(sleep_time)
 
-# Health check
+        today = datetime.date.today()
+        today_str = today.strftime("%m-%d")
+
+        birthdays = await execute_query(
+            "SELECT telegram_id, full_name FROM users WHERE birth_date IS NOT NULL AND SUBSTRING(birth_date FROM 6 FOR 5) = %s",
+            (today_str,), fetch=True
+        )
+
+        for tg_id, name in birthdays:
+            try:
+                await bot.send_message(
+                    tg_id,
+                    f"**С ДНЁМ РОЖДЕНИЯ, {name}!**\n\n"
+                    f"Пусть этот день будет полон радости, улыбок и хорошего настроения!\n"
+                    f"Желаем успехов в учёбе и всего самого лучшего!",
+                    parse_mode="Markdown"
+                )
+                logger.info(f"Поздравил {name} ({tg_id}) с ДР")
+            except Exception as e:
+                logger.error(f"Не удалось поздравить {tg_id}: {e}")
+
+# ВЕБ-СЕРВЕР ДЛЯ RENDER
 async def health_check(request):
     return web.Response(text="OK")
 
-# Запуск webhook
-async def on_startup(bot: Bot) -> None:
-    await bot.set_webhook(url=WEBHOOK_URL)
-    logger.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
-
-async def on_shutdown(bot: Bot) -> None:
-    await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("✅ Webhook удалён")
-
-# Основная функция
-async def main():
-    init_db()
-    
+async def web_server():
     app = web.Application()
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     app.router.add_get("/", health_check)
-    
-    setup_application(app, dp, bot=bot)
-    await on_startup(bot)
-    
-    port = int(os.getenv("PORT", 10000))
     runner = web.AppRunner(app)
     await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"🚀 Бот запущен на порту {port} в режиме webhook")
+    logger.info(f"Веб-сервер запущен на порту {port}")
+
+async def run_bot():
+    init_db()
+    logger.info("Бот запущен!")
+    await dp.start_polling(bot)
+
+# Обработка SIGTERM для Render
+async def shutdown(signal, loop):
+    logger.info(f"Получен сигнал {signal.name}...")
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    [task.cancel() for task in tasks]
+    await asyncio.gather(*tasks, return_exceptions=True)
+    loop.stop()
+
+async def main():
+    loop = asyncio.get_running_loop()
     
-    # Ждём бесконечно
-    await asyncio.Event().wait()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(
+            sig,
+            lambda s=sig: asyncio.create_task(shutdown(s, loop))
+        )
+    
+    await asyncio.gather(
+        web_server(),
+        run_bot(),
+        birthday_task()
+    )
 
 if __name__ == "__main__":
     try:
