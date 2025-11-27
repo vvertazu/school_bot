@@ -27,6 +27,11 @@ SUPER_ADMINS = [7450525550]  # ← Ваш ID
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME', 'your-service.onrender.com')}{WEBHOOK_PATH}"
 
+SUPER_ADMINS = [7450525550]  # Ваш ID
+
+def is_super_admin(user_id: int) -> bool:
+    return user_id in SUPER_ADMINS
+
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не установлен в переменных окружения!")
 if not DATABASE_URL:
@@ -198,6 +203,90 @@ async def process_fio(message: types.Message, state: FSMContext):
     
     await message.answer(f"✅ ФИО сохранено: **{fio}**", parse_mode="Markdown")
     await state.clear()
+
+# Сменить пароль для админов
+@dp.message(Command("change_master_pass"))
+async def change_master_pass(message: types.Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("🚫 Эта команда только для старшего админа")
+        return
+    
+    new_pass = message.text.replace("/change_master_pass", "", 1).strip()
+    if len(new_pass) < 6:
+        await message.answer("❌ Пароль должен быть минимум 6 символов")
+        return
+    
+    global ADMIN_PASSWORD
+    ADMIN_PASSWORD = new_pass
+    await message.answer(f"✅ Пароль для админов изменен на: `{new_pass}`", parse_mode="Markdown")
+    logger.critical(f"[SUPER_ADMIN] {message.from_user.id} изменил пароль для админов")
+
+# Назначить админа по ID
+@dp.message(Command("grant_admin"))
+async def grant_admin(message: types.Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("🚫 Эта команда только для старшего админа")
+        return
+    
+    try:
+        target_id = int(message.text.replace("/grant_admin", "", 1).strip())
+    except ValueError:
+        await message.answer("❌ Укажите корректный Telegram ID")
+        return
+    
+    await execute_query(
+        "UPDATE users SET is_admin = TRUE WHERE telegram_id = %s",
+        (target_id,)
+    )
+    await message.answer(f"✅ Пользователь `{target_id}` назначен админом", parse_mode="Markdown")
+    logger.critical(f"[SUPER_ADMIN] {message.from_user.id} назначил админа {target_id}")
+
+# Лишить прав админа
+@dp.message(Command("revoke_admin"))
+async def revoke_admin(message: types.Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("🚫 Эта команда только для старшего админа")
+        return
+    
+    try:
+        target_id = int(message.text.replace("/revoke_admin", "", 1).strip())
+    except ValueError:
+        await message.answer("❌ Укажите корректный Telegram ID")
+        return
+    
+    await execute_query(
+        "UPDATE users SET is_admin = FALSE WHERE telegram_id = %s",
+        (target_id,)
+    )
+    await message.answer(f"✅ Пользователь `{target_id}` лишен прав админа", parse_mode="Markdown")
+    logger.critical(f"[SUPER_ADMIN] {message.from_user.id} лишил прав админа {target_id}")
+
+# Бэкап базы данных
+@dp.message(Command("backup_db"))
+async def backup_db(message: types.Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("🚫 Эта команда только для старшего админа")
+        return
+    
+    # Экспорт данных в текстовый формат
+    users = await execute_query("SELECT telegram_id, full_name, is_admin FROM users", fetch=True)
+    homework = await execute_query("SELECT subject, description, due_date FROM homework", fetch=True)
+    
+    backup_text = f"== РЕЗЕРВНАЯ КОПИЯ БАЗЫ ==\nДата: {datetime.datetime.now():%Y-%m-%d %H:%M}\n\n"
+    backup_text += "== ПОЛЬЗОВАТЕЛИ ==\n"
+    for tg_id, name, is_admin in users:
+        backup_text += f"ID: {tg_id}, ФИО: {name}, Админ: {'ДА' if is_admin else 'НЕТ'}\n"
+    
+    backup_text += "\n== ДОМАШНИЕ ЗАДАНИЯ ==\n"
+    for subject, desc, due in homework:
+        backup_text += f"Предмет: {subject}, До: {due}\n{desc}\n\n"
+    
+    # Отправка файла
+    with open("backup.txt", "w", encoding="utf-8") as f:
+        f.write(backup_text)
+    
+    await message.answer_document(types.FSInputFile("backup.txt"), caption="✅ Резервная копия создана")
+    logger.critical(f"[SUPER_ADMIN] {message.from_user.id} создал резервную копию базы")
 
 @dp.message(Command("support"))
 async def cmd_support(message: types.Message):
