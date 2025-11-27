@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: school_bot
+    runtime: python-3.10  # ← Фиксируем версию Python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    envVars:
+      - key: BOT_TOKEN
+        value: ""
+      - key: DATABASE_URL
+        value: ""
+      - key: ADMIN_PASSWORD
+        value: "sunnatjalab"
