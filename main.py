@@ -5,6 +5,8 @@ import datetime
 import re
 import signal
 import psycopg2
+import json
+import io
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -12,7 +14,7 @@ from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # Логирование
@@ -23,15 +25,13 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "sunnatjalab")
-SUPER_ADMINS = [7450525550]  # ← Ваш ID
+SUPER_ADMINS = [7450525550]  # Старший админ (ваш ID)
+
+# Webhook настройки
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME', 'your-service.onrender.com')}{WEBHOOK_PATH}"
 
-SUPER_ADMINS = [7450525550]  # Ваш ID
-
-def is_super_admin(user_id: int) -> bool:
-    return user_id in SUPER_ADMINS
-
+# Проверка обязательных переменных
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не установлен в переменных окружения!")
 if not DATABASE_URL:
@@ -40,6 +40,15 @@ if not DATABASE_URL:
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+
+# Проверка прав супер-админа
+def is_super_admin(user_id: int) -> bool:
+    return user_id in SUPER_ADMINS
+
+# Проверка прав обычного админа
+async def is_admin(user_id: int) -> bool:
+    result = await get_user(user_id)
+    return result and result[1]  # result[1] = is_admin
 
 # Инициализация PostgreSQL базы
 def init_db():
@@ -126,9 +135,21 @@ class ClearSchedule(StatesGroup):
 class AdminPassword(StatesGroup):
     waiting_for_password = State()
 
+class EmergencyStop(StatesGroup):
+    confirming = State()
+
+class GrantAdmin(StatesGroup):
+    waiting_for_id = State()
+
+class RevokeAdmin(StatesGroup):
+    waiting_for_id = State()
+
+class ChangePassword(StatesGroup):
+    waiting_for_new_password = State()
+
 # Утилиты для PostgreSQL
 def execute_query_sync(query, params=(), fetch=False):
-    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require', connect_timeout=10)
     cursor = conn.cursor()
     cursor.execute(query, params)
     if fetch:
@@ -144,7 +165,7 @@ async def execute_query(query, params=(), fetch=False):
     return await asyncio.to_thread(execute_query_sync, query, params, fetch)
 
 def get_user_sync(user_id: int):
-    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require', connect_timeout=5)
     cursor = conn.cursor()
     cursor.execute("SELECT full_name, is_admin FROM users WHERE telegram_id = %s", (user_id,))
     result = cursor.fetchone()
@@ -168,7 +189,18 @@ reason_keyboard = ReplyKeyboardMarkup(
     one_time_keyboard=True
 )
 
-# Хендлеры
+# Клавиатура подтверждения
+confirm_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="✅ Подтвердить")],
+        [KeyboardButton(text="❌ Отмена")]
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True
+)
+
+# ХЕНДЛЕРЫ ДЛЯ СТУДЕНТОВ
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -177,8 +209,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if result and result[0]:
         await message.answer(
             f"Привет, {result[0]}! 👋\n\n"
-            "/schedule — Расписание Пример:/schedule ДД.ММ.ГГГГ\n"
+            "/schedule — Расписание\n"
             "/homework — ДЗ\n"
+            "/attendance — Посещаемость\n"
             "/support — Помощь"
         )
     else:
@@ -203,90 +236,6 @@ async def process_fio(message: types.Message, state: FSMContext):
     
     await message.answer(f"✅ ФИО сохранено: **{fio}**", parse_mode="Markdown")
     await state.clear()
-
-# Сменить пароль для админов
-@dp.message(Command("change_master_pass"))
-async def change_master_pass(message: types.Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("🚫 Эта команда только для старшего админа")
-        return
-    
-    new_pass = message.text.replace("/change_master_pass", "", 1).strip()
-    if len(new_pass) < 6:
-        await message.answer("❌ Пароль должен быть минимум 6 символов")
-        return
-    
-    global ADMIN_PASSWORD
-    ADMIN_PASSWORD = new_pass
-    await message.answer(f"✅ Пароль для админов изменен на: `{new_pass}`", parse_mode="Markdown")
-    logger.critical(f"[SUPER_ADMIN] {message.from_user.id} изменил пароль для админов")
-
-# Назначить админа по ID
-@dp.message(Command("grant_admin"))
-async def grant_admin(message: types.Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("🚫 Эта команда только для старшего админа")
-        return
-    
-    try:
-        target_id = int(message.text.replace("/grant_admin", "", 1).strip())
-    except ValueError:
-        await message.answer("❌ Укажите корректный Telegram ID")
-        return
-    
-    await execute_query(
-        "UPDATE users SET is_admin = TRUE WHERE telegram_id = %s",
-        (target_id,)
-    )
-    await message.answer(f"✅ Пользователь `{target_id}` назначен админом", parse_mode="Markdown")
-    logger.critical(f"[SUPER_ADMIN] {message.from_user.id} назначил админа {target_id}")
-
-# Лишить прав админа
-@dp.message(Command("revoke_admin"))
-async def revoke_admin(message: types.Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("🚫 Эта команда только для старшего админа")
-        return
-    
-    try:
-        target_id = int(message.text.replace("/revoke_admin", "", 1).strip())
-    except ValueError:
-        await message.answer("❌ Укажите корректный Telegram ID")
-        return
-    
-    await execute_query(
-        "UPDATE users SET is_admin = FALSE WHERE telegram_id = %s",
-        (target_id,)
-    )
-    await message.answer(f"✅ Пользователь `{target_id}` лишен прав админа", parse_mode="Markdown")
-    logger.critical(f"[SUPER_ADMIN] {message.from_user.id} лишил прав админа {target_id}")
-
-# Бэкап базы данных
-@dp.message(Command("backup_db"))
-async def backup_db(message: types.Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("🚫 Эта команда только для старшего админа")
-        return
-    
-    # Экспорт данных в текстовый формат
-    users = await execute_query("SELECT telegram_id, full_name, is_admin FROM users", fetch=True)
-    homework = await execute_query("SELECT subject, description, due_date FROM homework", fetch=True)
-    
-    backup_text = f"== РЕЗЕРВНАЯ КОПИЯ БАЗЫ ==\nДата: {datetime.datetime.now():%Y-%m-%d %H:%M}\n\n"
-    backup_text += "== ПОЛЬЗОВАТЕЛИ ==\n"
-    for tg_id, name, is_admin in users:
-        backup_text += f"ID: {tg_id}, ФИО: {name}, Админ: {'ДА' if is_admin else 'НЕТ'}\n"
-    
-    backup_text += "\n== ДОМАШНИЕ ЗАДАНИЯ ==\n"
-    for subject, desc, due in homework:
-        backup_text += f"Предмет: {subject}, До: {due}\n{desc}\n\n"
-    
-    # Отправка файла
-    with open("backup.txt", "w", encoding="utf-8") as f:
-        f.write(backup_text)
-    
-    await message.answer_document(types.FSInputFile("backup.txt"), caption="✅ Резервная копия создана")
-    logger.critical(f"[SUPER_ADMIN] {message.from_user.id} создал резервную копию базы")
 
 @dp.message(Command("support"))
 async def cmd_support(message: types.Message):
@@ -352,114 +301,96 @@ async def cmd_schedule(message: types.Message):
     
     await message.answer(text, parse_mode="Markdown")
 
-@dp.message(Command("announce"))
-async def cmd_announce(message: types.Message):
-    user = await get_user(message.from_user.id)
-    if not user or not user[1]:
-        await message.answer("Только админ")
-        return
-
-    text = message.text.replace("/announce", "", 1).strip()
-    if not text:
-        await message.answer("Использование: /announce Текст")
-        return
-
-    users = await execute_query("SELECT telegram_id FROM users", fetch=True)
-    sent = failed = 0
-    for (tg_id,) in users:
-        try:
-            await bot.send_message(tg_id, f"**Объявление**\n\n{text}", parse_mode="Markdown")
-            sent += 1
-        except Exception as e:
-            logger.warning(f"Не удалось отправить {tg_id}: {e}")
-            failed += 1
-
-    await message.answer(f"Отправлено: {sent}, ошибок: {failed}")
-
-@dp.message(Command("clear_homework"))
-async def clear_homework_start(message: types.Message, state: FSMContext):
-    user = await get_user(message.from_user.id)
-    if not user or not user[1]:
-        await message.answer("🚫 Только админ")
+@dp.message(Command("homework"))
+async def cmd_homework(message: types.Message):
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    hw_list = await execute_query(
+        "SELECT subject, description, due_date FROM homework WHERE due_date >= %s ORDER BY due_date",
+        (today,), fetch=True
+    )
+    
+    if not hw_list:
+        await message.answer("📚 Нет ДЗ")
         return
     
-    count = await execute_query("SELECT COUNT(*) FROM homework", fetch=True)
-    total = count[0][0] if count else 0
+    text = "📚 **Домашние задания**\n\n"
+    for subject, desc, due in hw_list:
+        text += f"📌 *{subject}* (до {due})\n{desc}\n\n"
+    
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("attendance"))
+async def cmd_attendance(message: types.Message):
+    today = datetime.date.today()
+    month_ago = today - datetime.timedelta(days=30)
+    
+    total_rows = await execute_query(
+        "SELECT COUNT(*) FROM attendance WHERE user_id = %s AND date BETWEEN %s AND %s",
+        (message.from_user.id, month_ago.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")), fetch=True
+    )
+    total = total_rows[0][0] if total_rows else 0
+
+    present_rows = await execute_query(
+        "SELECT COUNT(*) FROM attendance WHERE user_id = %s AND date BETWEEN %s AND %s AND status = 'present'",
+        (message.from_user.id, month_ago.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")), fetch=True
+    )
+    present = present_rows[0][0] if present_rows else 0
+    
+    percentage = round((present / total * 100) if total > 0 else 0, 1)
     
     await message.answer(
-        f"⚠️ <b>Внимание!</b>\n\n"
-        f"Вы собираетесь удалить <b>все домашние задания</b> ({total} записей).\n\n"
-        "Это действие нельзя отменить!\n\n"
-        "Подтвердите удаление, отправив: <code>ДА, УДАЛИТЬ ДЗ</code>",
-        parse_mode="HTML",
-        reply_markup=types.ReplyKeyboardMarkup(
-            keyboard=[[types.KeyboardButton(text="ДА, УДАЛИТЬ ДЗ")]],
-            resize_keyboard=True,
-            one_time_keyboard=True
-        )
+        f"**Посещаемость (30 дней)**\n\n"
+        f"Присутствовал: {present}/{total}\n"
+        f"**{percentage}%**\n\n"
+        "Напиши дату: 17.11.2025",
+        parse_mode="Markdown"
     )
-    await state.set_state(ClearHomework.confirming)
 
-@dp.message(ClearHomework.confirming)
-async def clear_homework_confirm(message: types.Message, state: FSMContext):
-    if message.text == "ДА, УДАЛИТЬ ДЗ":
-        result = await execute_query("DELETE FROM homework")
-        await message.answer(
-            f"✅ <b>Домашние задания очищены!</b>\n\n"
-            f"Удалено записей: {result}",
-            parse_mode="HTML",
-            reply_markup=types.ReplyKeyboardRemove()
+@dp.message(lambda msg: msg.text and len(msg.text) == 10 and msg.text.count('.') == 2)
+async def handle_date(message: types.Message):
+    try:
+        date = datetime.datetime.strptime(message.text, "%d.%m.%Y").date()
+        result = await execute_query(
+            "SELECT status, reason FROM attendance WHERE user_id = %s AND date = %s",
+            (message.from_user.id, date.strftime("%Y-%m-%d")), fetch=True
         )
-        logger.info(f"🧹 Админ {message.from_user.id} очистил домашние задания ({result} записей)")
-    else:
-        await message.answer(
-            "❌ Очистка ДЗ отменена",
-            reply_markup=types.ReplyKeyboardRemove()
-        )
-    
-    await state.clear()
+        
+        if not result:
+            await message.answer(f"❌ {date:%d.%m.%Y}: Нет отметки")
+            return
+        
+        status, reason = result[0]
+        if status == "present":
+            await message.answer(f"✅ {date:%d.%m.%Y}: Присутствовал")
+        elif status == "absent":
+            reason_text = f"\nПричина: {reason}" if reason else ""
+            await message.answer(f"❌ {date:%d.%m.%Y}: Отсутствовал{reason_text}")
+        else:
+            await message.answer(f"🕒 {date:%d.%m.%Y}: Опоздал")
+    except Exception as e:
+        logger.warning(f"Ошибка обработки даты: {e}")
+        await message.answer("❌ Ошибка обработки даты. Формат: 17.11.2025")
 
-@dp.message(Command("clear_schedule"))
-async def clear_schedule_start(message: types.Message, state: FSMContext):
-    user = await get_user(message.from_user.id)
-    if not user or not user[1]:
-        await message.answer("🚫 Только админ")
+@dp.message(Command("reason"))
+async def cmd_reason(message: types.Message, state: FSMContext):
+    await message.answer("Выбери причину:", reply_markup=reason_keyboard)
+    await state.set_state(AttendanceForm.choosing_reason)
+
+@dp.message(AttendanceForm.choosing_reason)
+async def process_reason(message: types.Message, state: FSMContext):
+    if message.text == "Отменить":
+        await message.answer("Отменено", reply_markup=types.ReplyKeyboardRemove())
+        await state.clear()
         return
     
-    count = await execute_query("SELECT COUNT(*) FROM schedule", fetch=True)
-    total = count[0][0] if count else 0
-    
-    await message.answer(
-        f"⚠️ <b>Внимание!</b>\n\n"
-        f"Вы собираетесь удалить <b>всё расписание</b> ({total} записей).\n\n"
-        "Это действие нельзя отменить!\n\n"
-        "Подтвердите удаление, отправив: <code>ДА, УДАЛИТЬ ВСЁ</code>",
-        parse_mode="HTML",
-        reply_markup=types.ReplyKeyboardMarkup(
-            keyboard=[[types.KeyboardButton(text="ДА, УДАЛИТЬ ВСЁ")]],
-            resize_keyboard=True,
-            one_time_keyboard=True
-        )
+    today = datetime.date.today()
+    await execute_query(
+        "INSERT INTO attendance (user_id, date, status, reason, marked_by) VALUES (%s, %s, %s, %s, %s) "
+        "ON CONFLICT (user_id, date) DO UPDATE SET status = EXCLUDED.status, reason = EXCLUDED.reason, marked_by = EXCLUDED.marked_by",
+        (message.from_user.id, today.strftime("%Y-%m-%d"), 'absent', message.text, message.from_user.id)
     )
-    await state.set_state(ClearSchedule.confirming)
-
-@dp.message(ClearSchedule.confirming)
-async def clear_schedule_confirm(message: types.Message, state: FSMContext):
-    if message.text == "ДА, УДАЛИТЬ ВСЁ":
-        result = await execute_query("DELETE FROM schedule")
-        await message.answer(
-            f"✅ <b>Расписание очищено!</b>\n\n"
-            f"Удалено записей: {result}",
-            parse_mode="HTML",
-            reply_markup=types.ReplyKeyboardRemove()
-        )
-        logger.info(f"🧹 Админ {message.from_user.id} очистил расписание ({result} записей)")
-    else:
-        await message.answer(
-            "❌ Очистка расписания отменена",
-            reply_markup=types.ReplyKeyboardRemove()
-        )
     
+    await message.answer(f"✅ Причина: **{message.text}**", reply_markup=types.ReplyKeyboardRemove(), parse_mode="Markdown")
     await state.clear()
 
 @dp.message(Command("whoami"))
@@ -481,6 +412,8 @@ async def cmd_whoami(message: types.Message):
         f"🔹 Статус: {admin_status}",
         parse_mode="Markdown"
     )
+
+# ХЕНДЛЕРЫ ДЛЯ АДМИНОВ
 
 @dp.message(Command("make_admin"))
 async def make_admin_start(message: types.Message, state: FSMContext):
@@ -525,29 +458,10 @@ async def process_admin_password(message: types.Message, state: FSMContext):
     
     await state.clear()
 
-@dp.message(Command("homework"))
-async def cmd_homework(message: types.Message):
-    today = datetime.date.today().strftime("%Y-%m-%d")
-    hw_list = await execute_query(
-        "SELECT subject, description, due_date FROM homework WHERE due_date >= %s ORDER BY due_date",
-        (today,), fetch=True
-    )
-    
-    if not hw_list:
-        await message.answer("📚 Нет ДЗ")
-        return
-    
-    text = "📚 **Домашние задания**\n\n"
-    for subject, desc, due in hw_list:
-        text += f"📌 *{subject}* (до {due})\n{desc}\n\n"
-    
-    await message.answer(text, parse_mode="Markdown")
-
 @dp.message(Command("add_hw"))
 async def cmd_add_hw(message: types.Message):
-    user = await get_user(message.from_user.id)
-    if not user or not user[1]:
-        await message.answer("Только админ")
+    if not await is_admin(message.from_user.id):
+        await message.answer("🚫 Только админ")
         return
     
     raw = message.text.replace("/add_hw", "", 1).strip()
@@ -589,12 +503,11 @@ async def cmd_add_hw(message: types.Message):
         (subject, desc_part.strip(), due_date_str, message.from_user.id)
     )
     
-    await message.answer(f"ДЗ по **{subject}** до {due_date:%d.%m}", parse_mode="Markdown")
+    await message.answer(f"✅ ДЗ по **{subject}** добавлено до {due_date:%d.%m}", parse_mode="Markdown")
 
 @dp.message(Command("add_schedule"))
 async def cmd_add_schedule(message: types.Message):
-    user = await get_user(message.from_user.id)
-    if not user or not user[1]:
+    if not await is_admin(message.from_user.id):
         await message.answer("🚫 Только админ")
         return
     
@@ -676,62 +589,33 @@ async def cmd_add_schedule(message: types.Message):
     else:
         await message.answer("❌ Не удалось добавить ни одного урока")
 
-@dp.message(Command("attendance"))
-async def cmd_attendance(message: types.Message):
-    today = datetime.date.today()
-    month_ago = today - datetime.timedelta(days=30)
-    
-    total_rows = await execute_query(
-        "SELECT COUNT(*) FROM attendance WHERE user_id = %s AND date BETWEEN %s AND %s",
-        (message.from_user.id, month_ago.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")), fetch=True
-    )
-    total = total_rows[0][0] if total_rows else 0
+@dp.message(Command("announce"))
+async def cmd_announce(message: types.Message):
+    if not await is_admin(message.from_user.id):
+        await message.answer("🚫 Только админ")
+        return
 
-    present_rows = await execute_query(
-        "SELECT COUNT(*) FROM attendance WHERE user_id = %s AND date BETWEEN %s AND %s AND status = 'present'",
-        (message.from_user.id, month_ago.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")), fetch=True
-    )
-    present = present_rows[0][0] if present_rows else 0
-    
-    percentage = round((present / total * 100) if total > 0 else 0, 1)
-    
-    await message.answer(
-        f"**Посещаемость (30 дней)**\n\n"
-        f"Присутствовал: {present}/{total}\n"
-        f"**{percentage}%**\n\n"
-        "Напиши дату: 17.11.2025",
-        parse_mode="Markdown"
-    )
+    text = message.text.replace("/announce", "", 1).strip()
+    if not text:
+        await message.answer("Использование: /announce Текст")
+        return
 
-@dp.message(lambda msg: msg.text and len(msg.text) == 10 and msg.text.count('.') == 2)
-async def handle_date(message: types.Message):
-    try:
-        date = datetime.datetime.strptime(message.text, "%d.%m.%Y").date()
-        result = await execute_query(
-            "SELECT status, reason FROM attendance WHERE user_id = %s AND date = %s",
-            (message.from_user.id, date.strftime("%Y-%m-%d")), fetch=True
-        )
-        
-        if not result:
-            await message.answer(f"❌ {date:%d.%m.%Y}: Нет отметки")
-            return
-        
-        status, reason = result[0]
-        if status == "present":
-            await message.answer(f"✅ {date:%d.%m.%Y}: Присутствовал")
-        elif status == "absent":
-            reason_text = f"\nПричина: {reason}" if reason else ""
-            await message.answer(f"❌ {date:%d.%m.%Y}: Отсутствовал{reason_text}")
-        else:
-            await message.answer(f"🕒 {date:%d.%m.%Y}: Опоздал")
-    except Exception as e:
-        logger.warning(f"Ошибка обработки даты: {e}")
+    users = await execute_query("SELECT telegram_id FROM users", fetch=True)
+    sent = failed = 0
+    for (tg_id,) in users:
+        try:
+            await bot.send_message(tg_id, f"**Объявление**\n\n{text}", parse_mode="Markdown")
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Не удалось отправить {tg_id}: {e}")
+            failed += 1
+
+    await message.answer(f"✅ Отправлено: {sent}, ❌ ошибок: {failed}")
 
 @dp.message(Command("birthday"))
 async def cmd_birthday(message: types.Message):
-    user = await get_user(message.from_user.id)
-    if not user or not user[1]:
-        await message.answer("Только админ может устанавливать дни рождения")
+    if not await is_admin(message.from_user.id):
+        await message.answer("🚫 Только админ может устанавливать дни рождения")
         return
 
     raw = message.text.replace("/birthday", "", 1).strip()
@@ -773,15 +657,14 @@ async def cmd_birthday(message: types.Message):
     user_id = matches[0][0]
     await execute_query(
         "UPDATE users SET birth_date = %s WHERE telegram_id = %s",
-        (birth_date, user_id)
+        (birth_date.strftime("%Y-%m-%d"), user_id)
     )
-    await message.answer(f"ДР для **{name}** установлен: **{date_str}**", parse_mode="Markdown")
+    await message.answer(f"✅ ДР для **{name}** установлен: **{date_str}**", parse_mode="Markdown")
 
 @dp.message(Command("birthdays"))
 async def cmd_birthdays_list(message: types.Message):
-    user = await get_user(message.from_user.id)
-    if not user or not user[1]:
-        await message.answer("Только админ")
+    if not await is_admin(message.from_user.id):
+        await message.answer("🚫 Только админ")
         return
 
     students = await execute_query(
@@ -805,9 +688,8 @@ async def cmd_birthdays_list(message: types.Message):
 
 @dp.message(Command("users"))
 async def cmd_users(message: types.Message):
-    user = await get_user(message.from_user.id)
-    if not user or not user[1]:
-        await message.answer("Только админ")
+    if not await is_admin(message.from_user.id):
+        await message.answer("🚫 Только админ")
         return
 
     all_users = await execute_query(
@@ -822,7 +704,7 @@ async def cmd_users(message: types.Message):
     text = "**Все пользователи**\n\n"
     for name, tg_id, joined, is_admin in all_users:
         name = name or "ФИО не указано"
-        admin_mark = " (админ)" if is_admin else ""
+        admin_mark = " (✅ админ)" if is_admin else ""
         joined_str = joined[:10] if joined else "?"
         text += f"• {name}{admin_mark} — `{tg_id}` — {joined_str}\n"
 
@@ -833,26 +715,374 @@ async def cmd_users(message: types.Message):
     else:
         await message.answer(text, parse_mode="Markdown")
 
-@dp.message(Command("reason"))
-async def cmd_reason(message: types.Message, state: FSMContext):
-    await message.answer("Выбери причину:", reply_markup=reason_keyboard)
-    await state.set_state(AttendanceForm.choosing_reason)
+@dp.message(Command("clear_homework"))
+async def clear_homework_start(message: types.Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("🚫 Только админ")
+        return
+    
+    count = await execute_query("SELECT COUNT(*) FROM homework", fetch=True)
+    total = count[0][0] if count else 0
+    
+    await message.answer(
+        f"⚠️ <b>Внимание!</b>\n\n"
+        f"Вы собираетесь удалить <b>все домашние задания</b> ({total} записей).\n\n"
+        "Это действие нельзя отменить!\n\n"
+        "Подтвердите удаление, отправив: <code>ДА, УДАЛИТЬ ДЗ</code>",
+        parse_mode="HTML",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="ДА, УДАЛИТЬ ДЗ")]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+    )
+    await state.set_state(ClearHomework.confirming)
 
-@dp.message(AttendanceForm.choosing_reason)
-async def process_reason(message: types.Message, state: FSMContext):
-    if message.text == "Отменить":
-        await message.answer("Отменено", reply_markup=types.ReplyKeyboardRemove())
+@dp.message(ClearHomework.confirming)
+async def clear_homework_confirm(message: types.Message, state: FSMContext):
+    if message.text == "ДА, УДАЛИТЬ ДЗ":
+        result = await execute_query("DELETE FROM homework")
+        await message.answer(
+            f"✅ <b>Домашние задания очищены!</b>\n\n"
+            f"Удалено записей: {result}",
+            parse_mode="HTML",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        logger.info(f"🧹 Админ {message.from_user.id} очистил домашние задания ({result} записей)")
+    else:
+        await message.answer(
+            "❌ Очистка ДЗ отменена",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+    
+    await state.clear()
+
+@dp.message(Command("clear_schedule"))
+async def clear_schedule_start(message: types.Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("🚫 Только админ")
+        return
+    
+    count = await execute_query("SELECT COUNT(*) FROM schedule", fetch=True)
+    total = count[0][0] if count else 0
+    
+    await message.answer(
+        f"⚠️ <b>Внимание!</b>\n\n"
+        f"Вы собираетесь удалить <b>всё расписание</b> ({total} записей).\n\n"
+        "Это действие нельзя отменить!\n\n"
+        "Подтвердите удаление, отправив: <code>ДА, УДАЛИТЬ ВСЁ</code>",
+        parse_mode="HTML",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="ДА, УДАЛИТЬ ВСЁ")]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+    )
+    await state.set_state(ClearSchedule.confirming)
+
+@dp.message(ClearSchedule.confirming)
+async def clear_schedule_confirm(message: types.Message, state: FSMContext):
+    if message.text == "ДА, УДАЛИТЬ ВСЁ":
+        result = await execute_query("DELETE FROM schedule")
+        await message.answer(
+            f"✅ <b>Расписание очищено!</b>\n\n"
+            f"Удалено записей: {result}",
+            parse_mode="HTML",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        logger.info(f"🧹 Админ {message.from_user.id} очистил расписание ({result} записей)")
+    else:
+        await message.answer(
+            "❌ Очистка расписания отменена",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+    
+    await state.clear()
+
+# ХЕНДЛЕРЫ ДЛЯ СУПЕР-АДМИНА
+
+@dp.message(Command("grant_admin"))
+async def grant_admin_start(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("🚫 Эта команда только для старшего админа")
+        return
+    
+    await message.answer("Введите Telegram ID пользователя, которого хотите сделать админом:")
+    await state.set_state(GrantAdmin.waiting_for_id)
+
+@dp.message(GrantAdmin.waiting_for_id)
+async def grant_admin_process(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
         await state.clear()
         return
     
-    today = datetime.date.today()
-    await execute_query(
-        "INSERT INTO attendance (user_id, date, status, reason, marked_by) VALUES (%s, %s, %s, %s, %s) "
-        "ON CONFLICT (user_id, date) DO UPDATE SET status = EXCLUDED.status, reason = EXCLUDED.reason, marked_by = EXCLUDED.marked_by",
-        (message.from_user.id, today.strftime("%Y-%m-%d"), 'absent', message.text, message.from_user.id)
+    try:
+        target_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Неверный формат ID. Введите число.")
+        return
+    
+    # Проверяем существует ли пользователь
+    user_exists = await execute_query(
+        "SELECT COUNT(*) FROM users WHERE telegram_id = %s",
+        (target_id,), fetch=True
     )
     
-    await message.answer(f"✅ Причина: **{message.text}**", reply_markup=types.ReplyKeyboardRemove(), parse_mode="Markdown")
+    if user_exists[0][0] == 0:
+        await message.answer(f"❌ Пользователь с ID `{target_id}` не найден в базе", parse_mode="Markdown")
+        await state.clear()
+        return
+    
+    # Делаем админом
+    await execute_query(
+        "UPDATE users SET is_admin = TRUE WHERE telegram_id = %s",
+        (target_id,)
+    )
+    
+    await message.answer(f"✅ Пользователь с ID `{target_id}` успешно назначен админом!", parse_mode="Markdown")
+    logger.critical(f"[SUPER_ADMIN] {message.from_user.id} назначил админа {target_id}")
+    await state.clear()
+
+@dp.message(Command("revoke_admin"))
+async def revoke_admin_start(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("🚫 Эта команда только для старшего админа")
+        return
+    
+    await message.answer("Введите Telegram ID админа, которого хотите разжаловать:")
+    await state.set_state(RevokeAdmin.waiting_for_id)
+
+@dp.message(RevokeAdmin.waiting_for_id)
+async def revoke_admin_process(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await state.clear()
+        return
+    
+    try:
+        target_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Неверный формат ID. Введите число.")
+        return
+    
+    # Проверяем существует ли пользователь
+    user_exists = await execute_query(
+        "SELECT COUNT(*) FROM users WHERE telegram_id = %s",
+        (target_id,), fetch=True
+    )
+    
+    if user_exists[0][0] == 0:
+        await message.answer(f"❌ Пользователь с ID `{target_id}` не найден в базе", parse_mode="Markdown")
+        await state.clear()
+        return
+    
+    # Разжалуем
+    await execute_query(
+        "UPDATE users SET is_admin = FALSE WHERE telegram_id = %s",
+        (target_id,)
+    )
+    
+    await message.answer(f"✅ Пользователь с ID `{target_id}` успешно лишен прав админа!", parse_mode="Markdown")
+    logger.critical(f"[SUPER_ADMIN] {message.from_user.id} лишил прав админа {target_id}")
+    await state.clear()
+
+@dp.message(Command("change_master_pass"))
+async def change_master_pass_start(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("🚫 Эта команда только для старшего админа")
+        return
+    
+    await message.answer(
+        "Введите новый пароль для админов (минимум 6 символов):",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+    await state.set_state(ChangePassword.waiting_for_new_password)
+
+@dp.message(ChangePassword.waiting_for_new_password)
+async def change_master_pass_process(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await state.clear()
+        return
+    
+    new_pass = message.text.strip()
+    if len(new_pass) < 6:
+        await message.answer("❌ Пароль должен быть минимум 6 символов. Попробуйте еще раз:")
+        return
+    
+    global ADMIN_PASSWORD
+    ADMIN_PASSWORD = new_pass
+    
+    await message.answer(f"✅ Пароль для админов успешно изменен!", parse_mode="Markdown")
+    logger.critical(f"[SUPER_ADMIN] {message.from_user.id} изменил мастер-пароль")
+    await state.clear()
+
+@dp.message(Command("backup_db"))
+async def backup_db(message: types.Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("🚫 Эта команда только для старшего админа")
+        return
+    
+    try:
+        # Экспортируем данные в JSON
+        users = await execute_query("SELECT telegram_id, full_name, is_admin, birth_date, joined_at FROM users", fetch=True)
+        homework = await execute_query("SELECT subject, description, due_date, added_by, created_at FROM homework", fetch=True)
+        schedule = await execute_query("SELECT date, lesson_number, subject, classroom, start_time, end_time, lesson_type, teacher FROM schedule", fetch=True)
+        attendance = await execute_query("SELECT user_id, date, status, reason, marked_by, marked_at FROM attendance", fetch=True)
+        
+        backup_data = {
+            "backup_date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "users": [
+                {
+                    "telegram_id": user[0],
+                    "full_name": user[1],
+                    "is_admin": user[2],
+                    "birth_date": user[3],
+                    "joined_at": user[4]
+                } for user in users
+            ],
+            "homework": [
+                {
+                    "subject": hw[0],
+                    "description": hw[1],
+                    "due_date": hw[2],
+                    "added_by": hw[3],
+                    "created_at": hw[4]
+                } for hw in homework
+            ],
+            "schedule": [
+                {
+                    "date": sch[0],
+                    "lesson_number": sch[1],
+                    "subject": sch[2],
+                    "classroom": sch[3],
+                    "start_time": sch[4],
+                    "end_time": sch[5],
+                    "lesson_type": sch[6],
+                    "teacher": sch[7]
+                } for sch in schedule
+            ],
+            "attendance": [
+                {
+                    "user_id": att[0],
+                    "date": att[1],
+                    "status": att[2],
+                    "reason": att[3],
+                    "marked_by": att[4],
+                    "marked_at": att[5]
+                } for att in attendance
+            ]
+        }
+        
+        # Создаем файл
+        json_str = json.dumps(backup_data, ensure_ascii=False, indent=2)
+        buffer = io.BytesIO(json_str.encode('utf-8'))
+        buffer.name = f"backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        
+        # Отправляем файл
+        document = FSInputFile(buffer, filename=buffer.name)
+        await message.answer_document(document, caption="✅ Резервная копия базы данных создана!")
+        logger.critical(f"[SUPER_ADMIN] {message.from_user.id} создал резервную копию базы данных")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при создании бэкапа: {str(e)}")
+        await message.answer(f"❌ Ошибка при создании бэкапа: {str(e)}")
+
+@dp.message(Command("admin_list"))
+async def admin_list(message: types.Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("🚫 Эта команда только для старшего админа")
+        return
+    
+    admins = await execute_query(
+        "SELECT telegram_id, full_name FROM users WHERE is_admin = TRUE",
+        fetch=True
+    )
+    
+    if not admins:
+        await message.answer("❌ Админы не найдены")
+        return
+    
+    text = "**Список администраторов**\n\n"
+    for tg_id, name in admins:
+        text += f"• {name or 'ФИО не указано'} (`{tg_id}`)\n"
+    
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("debug"))
+async def debug_command(message: types.Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("🚫 Эта команда только для старшего админа")
+        return
+    
+    query = message.text.replace("/debug", "", 1).strip()
+    if not query:
+        await message.answer("❌ Укажите SQL-запрос после команды")
+        return
+    
+    # Допускаем только SELECT-запросы для безопасности
+    if not query.upper().startswith("SELECT"):
+        await message.answer("❌ Разрешены только SELECT-запросы для безопасности")
+        return
+    
+    try:
+        result = await execute_query(query, fetch=True)
+        if not result:
+            await message.answer("🔍 Результат пуст")
+            return
+        
+        # Формируем ответ
+        text = f"**Результат запроса:**\n```sql\n{query}\n```\n\n"
+        for row in result[:10]:  # Ограничиваем 10 строками
+            text += " | ".join(str(x) for x in row) + "\n"
+        
+        if len(result) > 10:
+            text += f"\n... и еще {len(result) - 10} строк"
+        
+        await message.answer(text, parse_mode="Markdown")
+        logger.critical(f"[SUPER_ADMIN] {message.from_user.id} выполнил отладочный запрос: {query}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка в отладочном запросе: {str(e)}")
+        await message.answer(f"❌ Ошибка выполнения запроса: {str(e)}")
+
+@dp.message(Command("emergency_stop"))
+async def emergency_stop_start(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("🚫 Эта команда только для старшего админа")
+        return
+    
+    await message.answer(
+        "⚠️ <b>ЭКСТРЕННАЯ ОСТАНОВКА СЕРВИСА</b>\n\n"
+        "Вы уверены, что хотите <b>немедленно остановить бота</b>?\n\n"
+        "Это прервёт работу для всех пользователей!\n\n"
+        "Подтвердите действие кнопкой ниже:",
+        parse_mode="HTML",
+        reply_markup=confirm_keyboard
+    )
+    await state.set_state(EmergencyStop.confirming)
+
+@dp.message(EmergencyStop.confirming)
+async def emergency_stop_confirm(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await state.clear()
+        return
+    
+    if message.text == "✅ Подтвердить":
+        await message.answer(
+            "🛑 <b>БОТ ОСТАНАВЛИВАЕТСЯ...</b>\n\n"
+            "Все процессы будут завершены в течение 10 секунд.",
+            parse_mode="HTML",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        logger.critical(f"[SUPER_ADMIN] {message.from_user.id} ИНИЦИИРОВАЛ ЭКСТРЕННУЮ ОСТАНОВКУ СЕРВИСА")
+        
+        # Запускаем остановку в фоне
+        asyncio.create_task(shutdown(signal.SIGTERM, asyncio.get_running_loop()))
+    else:
+        await message.answer(
+            "✅ Экстренная остановка отменена",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+    
     await state.clear()
 
 # Ежедневная задача: поздравление с ДР
@@ -882,9 +1112,9 @@ async def birthday_task():
                     f"Желаем успехов в учёбе и всего самого лучшего!",
                     parse_mode="Markdown"
                 )
-                logger.info(f"Поздравил {name} ({tg_id}) с ДР")
+                logger.info(f"🎉 Поздравил {name} ({tg_id}) с ДР")
             except Exception as e:
-                logger.error(f"Не удалось поздравить {tg_id}: {e}")
+                logger.error(f"❌ Не удалось поздравить {tg_id}: {e}")
 
 # ВЕБ-СЕРВЕР ДЛЯ RENDER (ВЕБХУК-РЕЖИМ)
 async def on_startup(app):
@@ -933,6 +1163,14 @@ async def main():
     # Бесконечно ждем
     while True:
         await asyncio.sleep(3600)  # Спим час и проверяем
+
+# Обработка SIGTERM для Render
+async def shutdown(signal, loop):
+    logger.info(f"Получен сигнал {signal.name}...")
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    [task.cancel() for task in tasks]
+    await asyncio.gather(*tasks, return_exceptions=True)
+    loop.stop()
 
 if __name__ == "__main__":
     try:
